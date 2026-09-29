@@ -1,0 +1,108 @@
+{
+  "name": "substiflow",
+  "version": "1.0.0",
+  "description": "Faculty Timetable & Automatic Substitution Manager",
+  "main": "dist/main/electron/main.js",
+  "productName": "SubstiFlow",
+  "author": "SubstiFlow",
+  "license": "MIT",
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "predev": "node scripts/ensure-abi.js electron",
+    "dev": "npm run build:electron && concurrently -k -n vite,electron \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
+    "build": "npm run build:vite && npm run build:electron",
+    "build:vite": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json && node scripts/copy-assets.js",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "pretest": "node scripts/ensure-abi.js node",
+    "test": "vitest run",
+    "pretest:watch": "node scripts/ensure-abi.js node",
+    "test:watch": "vitest",
+    "icon": "node scripts/make-icon.js",
+    "predb:migrate": "node scripts/ensure-abi.js electron",
+    "db:migrate": "npm run build:electron && electron scripts/cli.js migrate",
+    "predb:seed": "node scripts/ensure-abi.js electron",
+    "db:seed": "npm run build:electron && electron scripts/cli.js seed",
+    "predist": "node scripts/ensure-abi.js win32",
+    "dist": "npm run build && electron-builder --win --x64",
+    "predist:dir": "node scripts/ensure-abi.js win32",
+    "dist:dir": "npm run build && electron-builder --win --x64 --dir"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^3.6.0",
+    "lucide-react": "^0.441.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.53.0",
+    "react-router-dom": "^6.26.2",
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.8",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.16.5",
+    "@types/react": "^18.3.8",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.5",
+    "vitest": "^2.1.1",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.substiflow.app",
+    "productName": "SubstiFlow",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/main/**/*",
+      "dist/renderer/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**"
+    ],
+    "win": {
+      "icon": "public/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "SubstiFlow-Setup.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "skandachandrashekar335-wq",
+      "repo": "SUBSTIFLOW"
+    }
+  }
+}

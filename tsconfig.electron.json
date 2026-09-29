@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": false,
+    "resolveJsonModule": true,
+    "isolatedModules": false,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "outDir": "dist/main",
+    "rootDir": ".",
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["electron/**/*", "src/db/**/*", "src/types/**/*"],
+  "exclude": ["node_modules", "dist", "src/db/repositories/**/*", "src/db/database.ts"]
+}
