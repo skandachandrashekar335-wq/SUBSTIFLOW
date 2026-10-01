@@ -8,7 +8,11 @@ import './index.css'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <HashRouter>
+    {/* Opt in to React Router v7 behaviour while staying on v6.30:
+        v7_startTransition wraps router state updates in React.startTransition,
+        v7_relativeSplatPath adopts the v7 relative resolution for the `*`
+        fallback route. Both also silence the v7 future-flag console warnings. */}
+    <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <App />
     </HashRouter>
   </React.StrictMode>,
