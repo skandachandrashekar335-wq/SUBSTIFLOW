@@ -42,11 +42,25 @@ export function runMigrations(db: SqlDatabase): void {
     .get()
 
   if (!hasSchemaVersion) {
-    db.exec(
-      `CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`
-    )
-    db.exec(schema)
-    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(1)
+    // First init is atomic: if schema application fails partway, everything
+    // rolls back so the next launch retries cleanly instead of stamping a
+    // half-created schema as complete.
+    db.exec('BEGIN')
+    try {
+      db.exec(
+        `CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`
+      )
+      db.exec(schema)
+      db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(1)
+      db.exec('COMMIT')
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK')
+      } catch {
+        // BEGIN never landed — nothing to roll back.
+      }
+      throw error
+    }
     return
   }
 

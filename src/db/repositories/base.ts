@@ -33,6 +33,28 @@ export abstract class BaseRepository<T extends BaseEntity> {
     return getDatabase()
   }
 
+  /**
+   * Run `fn` inside a transaction so a multi-statement write can never
+   * half-apply (e.g. mappings deleted but their replacements never inserted).
+   * The original error is rethrown after rollback.
+   */
+  protected transaction<R>(fn: () => R): R {
+    const db = this.db()
+    db.exec('BEGIN')
+    try {
+      const result = fn()
+      db.exec('COMMIT')
+      return result
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK')
+      } catch {
+        // BEGIN itself may have failed — nothing to roll back.
+      }
+      throw error
+    }
+  }
+
   findAll(): T[] {
     const rows = this.db()
       .prepare(`SELECT * FROM ${this.tableName} ORDER BY created_at DESC`)

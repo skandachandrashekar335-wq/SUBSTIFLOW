@@ -69,12 +69,16 @@ export class FacultyRepository extends BaseRepository<Faculty> {
   }
 
   setSubjects(facultyId: string, subjects: FacultySubject[]): void {
-    const db = this.db()
-    db.prepare('DELETE FROM faculty_subjects WHERE faculty_id = ?').run(facultyId)
-    const stmt = db.prepare('INSERT INTO faculty_subjects (faculty_id, subject_id, proficiency) VALUES (?, ?, ?)')
-    for (const s of subjects) {
-      stmt.run(s.facultyId, s.subjectId, s.proficiency)
-    }
+    // Atomic: a mid-loop failure must not leave the faculty with no (or
+    // partial) mappings after the old ones were already deleted.
+    this.transaction(() => {
+      const db = this.db()
+      db.prepare('DELETE FROM faculty_subjects WHERE faculty_id = ?').run(facultyId)
+      const stmt = db.prepare('INSERT INTO faculty_subjects (faculty_id, subject_id, proficiency) VALUES (?, ?, ?)')
+      for (const s of subjects) {
+        stmt.run(s.facultyId, s.subjectId, s.proficiency)
+      }
+    })
   }
 
   getSections(facultyId: string): FacultySection[] {
@@ -86,12 +90,15 @@ export class FacultyRepository extends BaseRepository<Faculty> {
   }
 
   setSections(facultyId: string, sectionIds: string[]): void {
-    const db = this.db()
-    db.prepare('DELETE FROM faculty_sections WHERE faculty_id = ?').run(facultyId)
-    const stmt = db.prepare('INSERT INTO faculty_sections (faculty_id, section_id) VALUES (?, ?)')
-    for (const sectionId of sectionIds) {
-      stmt.run(facultyId, sectionId)
-    }
+    // Atomic — see setSubjects.
+    this.transaction(() => {
+      const db = this.db()
+      db.prepare('DELETE FROM faculty_sections WHERE faculty_id = ?').run(facultyId)
+      const stmt = db.prepare('INSERT INTO faculty_sections (faculty_id, section_id) VALUES (?, ?)')
+      for (const sectionId of sectionIds) {
+        stmt.run(facultyId, sectionId)
+      }
+    })
   }
 
   getDailySubstitutionCount(facultyId: string, date: string): number {

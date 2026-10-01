@@ -22,9 +22,13 @@ export class AcademicYearRepository extends BaseRepository<AcademicYear> {
   }
 
   setActive(id: string): void {
-    const db = this.db()
-    db.prepare('UPDATE academic_years SET is_active = 0').run()
-    db.prepare('UPDATE academic_years SET is_active = 1, updated_at = datetime(\'now\') WHERE id = ?').run(id)
+    // Atomic: a failure between the two updates must never leave the
+    // application with no active academic year.
+    this.transaction(() => {
+      const db = this.db()
+      db.prepare('UPDATE academic_years SET is_active = 0').run()
+      db.prepare('UPDATE academic_years SET is_active = 1, updated_at = datetime(\'now\') WHERE id = ?').run(id)
+    })
   }
 }
 

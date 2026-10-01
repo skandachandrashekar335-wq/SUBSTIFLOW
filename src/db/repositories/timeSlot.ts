@@ -165,9 +165,13 @@ export class TimeSlotRepository extends BaseRepository<TimeSlot> {
     if (index === -1 || target < 0 || target >= ordered.length) return false
 
     const now = new Date().toISOString()
-    const stmt = this.db().prepare('UPDATE time_slots SET "order" = ?, updated_at = ? WHERE id = ?')
-    stmt.run(ordered[target].order, now, ordered[index].id)
-    stmt.run(ordered[index].order, now, ordered[target].id)
+    // Atomic swap: a partial failure must never leave two periods sharing
+    // the same order (the column has no unique constraint to catch it).
+    this.transaction(() => {
+      const stmt = this.db().prepare('UPDATE time_slots SET "order" = ?, updated_at = ? WHERE id = ?')
+      stmt.run(ordered[target].order, now, ordered[index].id)
+      stmt.run(ordered[index].order, now, ordered[target].id)
+    })
     return true
   }
 
@@ -231,36 +235,40 @@ export class TimeSlotRepository extends BaseRepository<TimeSlot> {
       )
     }
 
-    // Remove periods that no longer exist in the new schedule.
-    for (const slot of existing) {
-      if (!matches(slot)) super.delete(slot.id)
-    }
-
-    // Keep matching periods (only syncing the break flag), create the new ones.
-    for (const seg of segments) {
-      const match = existing.find(
-        s => toMinutes(s.startTime) === seg.start && toMinutes(s.endTime) === seg.end
-      )
-      if (match) {
-        if (Boolean(match.isBreak) !== seg.isBreak) super.update(match.id, { isBreak: seg.isBreak ? 1 : 0 })
-      } else {
-        super.create({
-          id: crypto.randomUUID(),
-          name: `${formatMinutes(seg.start)}-${formatMinutes(seg.end)}`,
-          startTime: formatMinutes(seg.start),
-          endTime: formatMinutes(seg.end),
-          order: seg.start,
-          isBreak: seg.isBreak ? 1 : 0,
-        })
+    // Mutations run as one transaction: periods must never be left half
+    // rebuilt (some deleted, replacements missing) if a statement fails.
+    this.transaction(() => {
+      // Remove periods that no longer exist in the new schedule.
+      for (const slot of existing) {
+        if (!matches(slot)) super.delete(slot.id)
       }
-    }
 
-    // Canonical order follows the clock.
-    const rows = this.db()
-      .prepare('SELECT id, start_time FROM time_slots ORDER BY start_time')
-      .all() as { id: string; start_time: string }[]
-    const stmt = this.db().prepare('UPDATE time_slots SET "order" = ? WHERE id = ?')
-    rows.forEach((row, index) => stmt.run(index + 1, row.id))
+      // Keep matching periods (only syncing the break flag), create the new ones.
+      for (const seg of segments) {
+        const match = existing.find(
+          s => toMinutes(s.startTime) === seg.start && toMinutes(s.endTime) === seg.end
+        )
+        if (match) {
+          if (Boolean(match.isBreak) !== seg.isBreak) super.update(match.id, { isBreak: seg.isBreak ? 1 : 0 })
+        } else {
+          super.create({
+            id: crypto.randomUUID(),
+            name: `${formatMinutes(seg.start)}-${formatMinutes(seg.end)}`,
+            startTime: formatMinutes(seg.start),
+            endTime: formatMinutes(seg.end),
+            order: seg.start,
+            isBreak: seg.isBreak ? 1 : 0,
+          })
+        }
+      }
+
+      // Canonical order follows the clock.
+      const rows = this.db()
+        .prepare('SELECT id, start_time FROM time_slots ORDER BY start_time')
+        .all() as { id: string; start_time: string }[]
+      const stmt = this.db().prepare('UPDATE time_slots SET "order" = ? WHERE id = ?')
+      rows.forEach((row, index) => stmt.run(index + 1, row.id))
+    })
 
     return this.getOrdered()
   }

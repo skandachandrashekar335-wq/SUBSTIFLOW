@@ -20,9 +20,16 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
   }
 
   set(key: string, value: string, description?: string): ApplicationSettings {
-    const existing = this.db().prepare('SELECT id FROM application_settings WHERE key = ?').get(key) as { id: string } | undefined
+    const existing = this.db()
+      .prepare('SELECT id, description FROM application_settings WHERE key = ?')
+      .get(key) as { id: string; description: string | null } | undefined
     if (existing) {
-      return this.update(existing.id, { value, description })!
+      // A plain set(key, value) must not wipe the row's description
+      // (the base update writes undefined/omitted columns as NULL).
+      return this.update(existing.id, {
+        value,
+        description: description !== undefined ? description : existing.description ?? undefined,
+      })!
     }
     return this.create({
       id: crypto.randomUUID(),
