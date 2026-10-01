@@ -28,6 +28,24 @@
  * 19. QA-012: the Add Entry dialog's displayed Time Slot / Section / Room are
  *     the actual form state — what the selects show is what gets submitted
  *     (and validation still rejects a truly empty state)
+ * 20. QA-024: generation reports true statistics immediately (the Locked stat
+ *     was hardcoded to 0 until a manual refresh)
+ * 21. QA-025: removing/re-picking a substitute replaces the stale reasoning
+ *     and score — an uncovered row never shows the old candidate's praise
+ * 22. QA-023: APPROVED is a real, visible lifecycle state — editing or
+ *     regenerating an approved plan reopens it and clears approval metadata
+ * 23. QA-021: uncovered rows resolve to a real assignment id the manual
+ *     picker can use (the synthetic id:'' never resolves)
+ * 24. Hard constraint (e): periods outside configured working hours can never
+ *     receive substitutions — generation or manual
+ * 25. Hard constraint (j): unrelated (P5) faculty are excluded from the
+ *     manual picker/override while the configuration disallows them
+ * 26. Integrity: multi-statement writes are atomic (failed mapping save rolls
+ *     back; switching active year always leaves exactly one active year)
+ * 27. Integrity: a plain settings set() no longer wipes the stored
+ *     description
+ * 28. Integrity: assignment status and is_locked can never diverge
+ * 29. QA-026: getRevisedTimetable returns a truthful revised day view
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
@@ -51,6 +69,17 @@ import {
   deleteTimetableEntry,
   buildAddEntryDefaults,
 } from '@/services/timetable'
+import { substitutionRunRepository, substitutionAssignmentRepository } from '@/db/repositories'
+import {
+  generateSubstitutions,
+  getSubstitutionRun,
+  approveSubstitutionRun,
+  updateSubstitutionAssignment,
+  availableSubstitutesForAssignment,
+  validateSubstitute,
+  lockAssignment,
+  getRevisedTimetable,
+} from '@/services/substitution'
 
 let testDb: Database.Database | null = null
 
@@ -596,5 +625,424 @@ describe('QA-012: add entry form state matches the displayed selects', () => {
     expect(
       buildAddEntryDefaults({ teachingSlots: [], sections: [], rooms: [] })
     ).toEqual({ timeSlotId: '', sectionId: '', roomId: '' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Shared substitution fixture for blocks 20–29: one absent teacher who loses
+// two Wednesday slot-4 classes; two free, related colleagues as candidates.
+// ---------------------------------------------------------------------------
+const SUB_DATE = '2024-09-25' // Wednesday — matches the entries below
+
+function seedSubstitutionScenario(): void {
+  departmentRepository.create({ id: 'dept-other', name: 'Languages', code: 'LANG' })
+  facultyRepository.create({ id: 'fac-3', name: 'Mr. Related', departmentId: 'dept-bca', maxDailySubstitutions: 5 })
+  facultyRepository.create({ id: 'fac-4', name: 'Ms. Outsider', departmentId: 'dept-other', maxDailySubstitutions: 5 })
+  facultyRepository.setSubjects('fac-3', [{ facultyId: 'fac-3', subjectId: 'sub-1', proficiency: 4 }])
+  timetableEntryRepository.create({
+    id: 'tt-sub-1', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-4',
+    sectionId: 'sec-1', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-1', classType: 'LECTURE',
+  })
+  timetableEntryRepository.create({
+    id: 'tt-sub-2', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-5',
+    sectionId: 'sec-2', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-2', classType: 'LECTURE',
+  })
+  attendanceRepository.upsert(SUB_DATE, 'fac-1', 'ABSENT')
+}
+
+function runRow(): any {
+  return testDb!.prepare('SELECT * FROM substitution_runs WHERE date = ?').get(SUB_DATE)
+}
+
+function assignmentRow(id: string): any {
+  return testDb!.prepare('SELECT * FROM substitution_assignments WHERE id = ?').get(id)
+}
+
+// ---------------------------------------------------------------------------
+// 20. QA-024: generation result statistics reflect the saved run immediately
+// ---------------------------------------------------------------------------
+describe('QA-024: generation reports true statistics immediately', () => {
+  it('the Locked stat matches the locked rows right after Generate (no refresh needed)', () => {
+    seedSubstitutionScenario()
+    const first = generateSubstitutions(SUB_DATE)
+    expect(first.status).toBe('GENERATED')
+    expect(first.statistics.manuallyAssigned).toBe(
+      first.assignments.filter(a => a.status === 'LOCKED').length
+    )
+
+    const covered = first.assignments.find(a => a.substituteFacultyId)!
+    expect(covered).toBeTruthy()
+    expect(lockAssignment(covered.id)).toBeTruthy()
+
+    const regen = generateSubstitutions(SUB_DATE)
+    const locked = regen.assignments.filter(a => a.status === 'LOCKED')
+    expect(locked.length).toBeGreaterThanOrEqual(1)
+    // The QA-024 symptom: this used to be hardcoded to 0 until Refresh.
+    expect(regen.statistics.manuallyAssigned).toBeGreaterThan(0)
+    expect(regen.statistics.manuallyAssigned).toBe(locked.length)
+
+    // …and it agrees with what a later reload shows.
+    const reloaded = getSubstitutionRun(SUB_DATE)!
+    expect(reloaded.statistics.manuallyAssigned).toBe(regen.statistics.manuallyAssigned)
+  })
+
+  it('covered/uncovered statistics are counted from the persisted rows', () => {
+    seedSubstitutionScenario()
+    const result = generateSubstitutions(SUB_DATE)
+    const persisted = substitutionAssignmentRepository.findByRunWithRelations(result.runId)
+    expect(result.assignments).toHaveLength(persisted.length)
+    expect(result.statistics.covered).toBe(persisted.filter(a => a.substituteFacultyId).length)
+    expect(result.statistics.uncovered).toBe(persisted.filter(a => !a.substituteFacultyId).length)
+    expect(result.statistics.totalAffected).toBeGreaterThanOrEqual(persisted.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 21. QA-025: stale reasoning belonging to a removed substitute
+// ---------------------------------------------------------------------------
+describe('QA-025: uncovered rows never show a removed substitute reasoning', () => {
+  it('removing a substitute replaces the positive reasoning and clears the score', () => {
+    seedSubstitutionScenario()
+    const result = generateSubstitutions(SUB_DATE)
+    const covered = result.assignments.find(a => a.substituteFacultyId)!
+    const oldReasoning = covered.reasoning
+    expect(oldReasoning).toBeTruthy()
+    expect(covered.score).not.toBeNull()
+
+    expect(updateSubstitutionAssignment(covered.id, { substituteFacultyId: null })).toBeTruthy()
+
+    const run = getSubstitutionRun(SUB_DATE)!
+    const row = run.assignments.find(a => a.id === covered.id)!
+    expect(row.substituteFacultyId).toBeNull()
+    expect(row.reasoning).toMatch(/removed by coordinator/i)
+    expect(row.reasoning).not.toBe(oldReasoning)
+    expect(row.score).toBeNull()
+
+    // The Uncovered card's reason must be truthful too — not the old
+    // candidate's praise ("normally teaches this class…").
+    const uncovered = run.uncovered.find(u => u.originalEntryId === covered.originalEntryId)
+    expect(uncovered).toBeTruthy()
+    expect(uncovered!.reason).toMatch(/removed by coordinator/i)
+  })
+
+  it('re-picking a different substitute replaces the previous candidate reasoning and score', () => {
+    seedSubstitutionScenario()
+    const result = generateSubstitutions(SUB_DATE)
+    const covered = result.assignments.find(a => a.substituteFacultyId)!
+    const oldReasoning = covered.reasoning
+    const replacement = availableSubstitutesForAssignment(covered.id).find(
+      f => f.id !== covered.substituteFacultyId
+    )
+    expect(replacement).toBeTruthy()
+    expect(
+      updateSubstitutionAssignment(covered.id, { substituteFacultyId: replacement!.id })
+    ).toBeTruthy()
+
+    const row = getSubstitutionRun(SUB_DATE)!.assignments.find(a => a.id === covered.id)!
+    expect(row.substituteFacultyId).toBe(replacement!.id)
+    expect(row.reasoning).toMatch(/manually assigned by coordinator/i)
+    expect(row.reasoning).not.toBe(oldReasoning)
+    expect(row.score).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 22. QA-023: APPROVED is a visible, never-stale lifecycle state
+// ---------------------------------------------------------------------------
+describe('QA-023: approval lifecycle is visible and never stale', () => {
+  it('the run result carries APPROVED status and approval metadata', () => {
+    seedSubstitutionScenario()
+    generateSubstitutions(SUB_DATE)
+    expect(approveSubstitutionRun(SUB_DATE, 'QA Coordinator')).toBeTruthy()
+    const run = getSubstitutionRun(SUB_DATE)!
+    expect(run.status).toBe('APPROVED')
+    expect(run.approvedBy).toBe('QA Coordinator')
+    expect(run.approvedAt).toBeTruthy()
+  })
+
+  it('editing an approved plan reopens it and clears the approval metadata', () => {
+    seedSubstitutionScenario()
+    generateSubstitutions(SUB_DATE)
+    approveSubstitutionRun(SUB_DATE, 'QA Coordinator')
+    const covered = getSubstitutionRun(SUB_DATE)!.assignments.find(a => a.substituteFacultyId)!
+    const replacement = availableSubstitutesForAssignment(covered.id).find(
+      f => f.id !== covered.substituteFacultyId
+    )!
+    expect(
+      updateSubstitutionAssignment(covered.id, { substituteFacultyId: replacement.id })
+    ).toBeTruthy()
+
+    const row = runRow()
+    expect(row.status).toBe('GENERATED')
+    expect(row.approved_by).toBeNull()
+    expect(row.approved_at).toBeNull()
+    // …and the result the planner renders agrees with the database.
+    expect(getSubstitutionRun(SUB_DATE)!.status).toBe('GENERATED')
+  })
+
+  it('regenerating an approved plan clears approval metadata (no stale approver)', () => {
+    seedSubstitutionScenario()
+    generateSubstitutions(SUB_DATE)
+    approveSubstitutionRun(SUB_DATE, 'QA Coordinator')
+    generateSubstitutions(SUB_DATE)
+
+    const row = runRow()
+    expect(row.status).toBe('GENERATED')
+    expect(row.approved_by).toBeNull()
+    expect(row.approved_at).toBeNull()
+  })
+
+  it('locking an assignment after approval reopens the plan as well', () => {
+    seedSubstitutionScenario()
+    generateSubstitutions(SUB_DATE)
+    approveSubstitutionRun(SUB_DATE, 'QA Coordinator')
+    const covered = getSubstitutionRun(SUB_DATE)!.assignments.find(a => a.substituteFacultyId)!
+    expect(lockAssignment(covered.id)).toBeTruthy()
+
+    const row = runRow()
+    expect(row.status).toBe('GENERATED')
+    expect(row.approved_by).toBeNull()
+    expect(row.approved_at).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 23. QA-021: uncovered rows resolve to a real assignment the picker can use
+// ---------------------------------------------------------------------------
+describe('QA-021: the uncovered card opens a picker that actually works', () => {
+  it('the synthetic id:"" never resolves, but the real uncovered row does', () => {
+    seedSubstitutionScenario()
+    // Force every affected class uncovered (generation-level daily cap = 0).
+    settingsRepository.set('max_daily_substitutions', '0', 'Maximum daily substitutions per faculty')
+    const result = generateSubstitutions(SUB_DATE)
+    expect(result.uncovered.length).toBeGreaterThan(0)
+
+    const uncoveredRow = result.assignments.find(a => !a.substituteFacultyId)
+    expect(uncoveredRow).toBeTruthy()
+
+    // The pre-fix UI sent id:'' — it could never produce a single option.
+    expect(availableSubstitutesForAssignment('')).toEqual([])
+
+    // The real row resolves to a usable picker, and every option it offers
+    // is accepted by the very function the dialog calls on submit.
+    const options = availableSubstitutesForAssignment(uncoveredRow!.id)
+    expect(options.length).toBeGreaterThan(0)
+    expect(
+      updateSubstitutionAssignment(uncoveredRow!.id, { substituteFacultyId: options[0].id })
+    ).toBeTruthy()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 24. Hard constraint (e): outside working hours can never receive substitutions
+// ---------------------------------------------------------------------------
+describe('hard constraint: periods outside working hours', () => {
+  it('neither generation nor the manual validator places a substitute out of hours', () => {
+    seedSubstitutionScenario()
+    expect(settingsRepository.getWorkingHours().startTime).toBe('09:00')
+    expect(settingsRepository.getWorkingHours().endTime).toBe('16:00')
+
+    const early = timeSlotRepository.create({
+      id: 'slot-early', name: '07:00-08:00', startTime: '07:00', endTime: '08:00',
+    })
+    timetableEntryRepository.create({
+      id: 'tt-early', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: early.id,
+      sectionId: 'sec-1', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-1', classType: 'LECTURE',
+    })
+
+    const result = generateSubstitutions(SUB_DATE)
+    expect(result.uncovered.some(u => u.originalEntryId === 'tt-early')).toBe(true)
+    const earlyRow = result.assignments.find(a => a.originalEntryId === 'tt-early')
+    expect(earlyRow).toBeTruthy()
+    expect(earlyRow!.substituteFacultyId).toBeNull()
+
+    // Manual override refuses the same period with a clear reason.
+    const entry = timetableEntryRepository.getWithRelations('year-1').find(e => e.id === 'tt-early')!
+    const check = validateSubstitute(
+      {
+        date: SUB_DATE,
+        academicYearId: 'year-1',
+        dayOfWeek: 'WEDNESDAY',
+        timeSlotId: early.id,
+        isBreak: false,
+        entryId: entry.id,
+        entry,
+      },
+      'fac-3'
+    )
+    expect(check.ok).toBe(false)
+    expect(check.reason).toMatch(/outside working hours/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 25. Hard constraint (j): unrelated (P5) faculty only when configured
+// ---------------------------------------------------------------------------
+describe('hard constraint: unrelated faculty only when configuration allows', () => {
+  function slotForCovered() {
+    const result = generateSubstitutions(SUB_DATE)
+    const covered = result.assignments.find(a => a.substituteFacultyId)!
+    const entry = timetableEntryRepository.getWithRelations('year-1').find(e => e.id === covered.originalEntryId)!
+    return {
+      covered,
+      slot: {
+        date: SUB_DATE,
+        academicYearId: 'year-1',
+        dayOfWeek: entry.dayOfWeek,
+        timeSlotId: entry.timeSlotId,
+        isBreak: false,
+        entryId: entry.id,
+        entry,
+      },
+    }
+  }
+
+  it('the manual validator and picker refuse unrelated faculty while the setting is off', () => {
+    seedSubstitutionScenario()
+    const { covered, slot } = slotForCovered()
+
+    settingsRepository.setAllowUnrelatedSubstitutions(false)
+    const check = validateSubstitute(slot, 'fac-4') // other dept, no mappings — P5
+    expect(check.ok).toBe(false)
+    expect(check.reason).toMatch(/not related/i)
+    expect(
+      availableSubstitutesForAssignment(covered.id).some(f => f.id === 'fac-4')
+    ).toBe(false)
+  })
+
+  it('the same faculty is allowed when unrelated substitutions are enabled', () => {
+    seedSubstitutionScenario()
+    const { slot } = slotForCovered()
+
+    settingsRepository.setAllowUnrelatedSubstitutions(true)
+    const check = validateSubstitute(slot, 'fac-4')
+    expect(check.ok).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 26. Integrity: multi-statement writes are atomic
+// ---------------------------------------------------------------------------
+describe('integrity: multi-statement writes are atomic', () => {
+  it('a failed subject-mapping save rolls back instead of wiping the old mappings', () => {
+    facultyRepository.setSubjects('fac-1', [{ facultyId: 'fac-1', subjectId: 'sub-1', proficiency: 5 }])
+    expect(facultyRepository.getSubjects('fac-1')).toHaveLength(1)
+
+    expect(() =>
+      facultyRepository.setSubjects('fac-1', [
+        { facultyId: 'fac-1', subjectId: 'ghost-subject', proficiency: 5 },
+      ])
+    ).toThrow() // foreign-key violation
+
+    // Rollback preserved the original mapping (pre-fix: it was already deleted).
+    const after = facultyRepository.getSubjects('fac-1')
+    expect(after).toHaveLength(1)
+    expect(after[0].subjectId).toBe('sub-1')
+  })
+
+  it('a failed section-mapping save rolls back the same way', () => {
+    facultyRepository.setSections('fac-1', ['sec-1'])
+    expect(facultyRepository.getSections('fac-1')).toHaveLength(1)
+    expect(() => facultyRepository.setSections('fac-1', ['ghost-section'])).toThrow()
+    const after = facultyRepository.getSections('fac-1')
+    expect(after).toHaveLength(1)
+    expect(after[0].sectionId).toBe('sec-1')
+  })
+
+  it('switching the active academic year always leaves exactly one active year', () => {
+    academicYearRepository.create({
+      id: 'year-2', name: '2025-2026', startDate: '2025-06-01', endDate: '2026-05-31', isActive: false,
+    })
+    academicYearRepository.setActive('year-2')
+    let actives = testDb!.prepare('SELECT id FROM academic_years WHERE is_active = 1').all() as any[]
+    expect(actives).toHaveLength(1)
+    expect(actives[0].id).toBe('year-2')
+
+    academicYearRepository.setActive('year-1')
+    actives = testDb!.prepare('SELECT id FROM academic_years WHERE is_active = 1').all() as any[]
+    expect(actives).toHaveLength(1)
+    expect(actives[0].id).toBe('year-1')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 27. Integrity: a plain settings set() keeps the stored description
+// ---------------------------------------------------------------------------
+describe('integrity: settings writes do not destroy metadata', () => {
+  it('set(key, value) preserves the row description', () => {
+    settingsRepository.set('qa_test_key', 'v1', 'Original description')
+    settingsRepository.set('qa_test_key', 'v2')
+    const row = testDb!
+      .prepare('SELECT value, description FROM application_settings WHERE key = ?')
+      .get('qa_test_key') as { value: string; description: string | null }
+    expect(row.value).toBe('v2')
+    expect(row.description).toBe('Original description')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 28. Integrity: assignment status and is_locked never diverge
+// ---------------------------------------------------------------------------
+describe('integrity: status and is_locked never diverge', () => {
+  it("status: 'LOCKED' also sets is_locked, and the row survives regeneration", () => {
+    seedSubstitutionScenario()
+    const result = generateSubstitutions(SUB_DATE)
+    const covered = result.assignments.find(a => a.substituteFacultyId)!
+    const substitute = covered.substituteFacultyId
+
+    expect(updateSubstitutionAssignment(covered.id, { status: 'LOCKED' })).toBeTruthy()
+    let row = assignmentRow(covered.id)
+    expect(row.status).toBe('LOCKED')
+    expect(row.is_locked).toBe(1)
+
+    expect(updateSubstitutionAssignment(covered.id, { status: 'PENDING' })).toBeTruthy()
+    row = assignmentRow(covered.id)
+    expect(row.status).toBe('PENDING')
+    expect(row.is_locked).toBe(0)
+
+    // Locked for real (both fields), then regenerate: keyed on is_locked=1,
+    // the row must survive with its substitute intact.
+    expect(updateSubstitutionAssignment(covered.id, { status: 'LOCKED' })).toBeTruthy()
+    generateSubstitutions(SUB_DATE)
+    row = assignmentRow(covered.id)
+    expect(row.status).toBe('LOCKED')
+    expect(row.is_locked).toBe(1)
+    expect(row.substitute_faculty_id).toBe(substitute)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 29. QA-026: the revised-timetable service returns a truthful day view
+// ---------------------------------------------------------------------------
+describe('QA-026: getRevisedTimetable returns a truthful revised day view', () => {
+  it('covers every period of the day with per-row substitution status', () => {
+    seedSubstitutionScenario()
+    generateSubstitutions(SUB_DATE)
+
+    const revised = getRevisedTimetable(SUB_DATE)
+    expect(revised.length).toBeGreaterThanOrEqual(2)
+    for (const row of revised) {
+      expect(row.originalEntry).toBeTruthy()
+      expect(row.originalEntry.timeSlot).toBeTruthy()
+      expect(row.originalEntry.section).toBeTruthy()
+      expect(row.originalEntry.subject).toBeTruthy()
+      expect(row.originalEntry.faculty).toBeTruthy()
+    }
+
+    const substituted = revised.filter(r => r.isSubstituted)
+    expect(substituted.length).toBeGreaterThanOrEqual(1)
+    for (const row of substituted) {
+      expect(row.substitution?.substituteFacultyId).toBeTruthy()
+      expect(row.substituteFaculty?.name).toBeTruthy()
+    }
+    // isSubstituted is exactly "has a substitute" — never optimistic.
+    expect(revised.every(r => r.isSubstituted === !!r.substitution?.substituteFacultyId)).toBe(true)
+  })
+
+  it('a date with no run returns rows with no substitutions (nothing invented)', () => {
+    seedSubstitutionScenario()
+    const revised = getRevisedTimetable(SUB_DATE)
+    expect(revised.length).toBeGreaterThanOrEqual(2)
+    expect(revised.some(r => r.isSubstituted)).toBe(false)
   })
 })
