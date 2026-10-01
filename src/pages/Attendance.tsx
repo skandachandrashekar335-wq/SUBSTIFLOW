@@ -96,7 +96,7 @@ export function Attendance() {
           <p className="text-secondary-500">Mark absent faculty for {dayName}</p>
         </div>
         <div className="flex items-center gap-3">
-          <Button variant="outline" size="sm" onClick={() => setCurrentDate(format(subDays(parseISODate(today), 1), 'yyyy-MM-dd'))}>
+          <Button variant="outline" size="sm" aria-label="Previous day" onClick={() => setCurrentDate(format(subDays(parseISODate(today), 1), 'yyyy-MM-dd'))}>
             <ChevronLeft className="h-4 w-4" />
           </Button>
           <input
@@ -109,7 +109,7 @@ export function Attendance() {
             }}
             className="w-auto px-3 py-2 border border-secondary-300 rounded-lg text-sm focus:border-primary-500 focus:ring-1 focus:ring-primary-500"
           />
-          <Button variant="outline" size="sm" onClick={() => setCurrentDate(format(addDays(parseISODate(today), 1), 'yyyy-MM-dd'))}>
+          <Button variant="outline" size="sm" aria-label="Next day" onClick={() => setCurrentDate(format(addDays(parseISODate(today), 1), 'yyyy-MM-dd'))}>
             <ChevronRight className="h-4 w-4" />
           </Button>
           <Button variant="outline" size="sm" onClick={() => setCurrentDate(format(new Date(), 'yyyy-MM-dd'))}>

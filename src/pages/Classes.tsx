@@ -88,7 +88,7 @@ export function Classes() {
   }
 
   const handleDelete = (id: string) => {
-    if (!confirm('Delete this section? This will also remove its timetable entries.')) return
+    if (!confirm('Delete this section? This will also remove its timetable entries AND its substitution history for those classes. This cannot be undone.')) return
     try {
       sectionRepository.delete(id)
       if (currentAcademicYear) {
@@ -168,7 +168,7 @@ export function Classes() {
                         <Edit className="h-4 w-4" />
                         Edit
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => handleDelete(s.id)} className="text-danger-600 hover:text-danger-700">
+                      <Button variant="ghost" size="sm" onClick={() => handleDelete(s.id)} aria-label={`Delete section ${s.name}`} className="text-danger-600 hover:text-danger-700">
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>

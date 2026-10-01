@@ -156,7 +156,7 @@ export function Dashboard() {
             ) : (
               <div className="divide-y divide-secondary-200">
                 {recentRuns.map((run) => (
-                  <Link key={run.id} to="/substitution" className="block p-4 hover:bg-secondary-50 transition-colors">
+                  <Link key={run.id} to={`/substitution?date=${run.date}`} className="block p-4 hover:bg-secondary-50 transition-colors">
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="font-medium text-secondary-900">{format(new Date(run.date + 'T00:00:00'), 'MMM d, yyyy')}</p>

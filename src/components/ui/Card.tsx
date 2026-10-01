@@ -4,11 +4,13 @@ import { cn } from '@/utils/cn'
 export interface CardProps {
   children: ReactNode
   className?: string
+  /** Extra attributes (e.g. data-testid) are forwarded to the wrapper div. */
+  [key: string]: unknown
 }
 
-export function Card({ children, className }: CardProps) {
+export function Card({ children, className, ...rest }: CardProps) {
   return (
-    <div className={cn('bg-white rounded-xl border border-secondary-200 shadow-sm', className)}>
+    <div className={cn('bg-white rounded-xl border border-secondary-200 shadow-sm', className)} {...rest}>
       {children}
     </div>
   )

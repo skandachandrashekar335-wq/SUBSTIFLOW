@@ -236,10 +236,10 @@ export function Faculty() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => handleEdit(f)}>
+                        <Button variant="ghost" size="sm" onClick={() => handleEdit(f)} aria-label={`Edit ${f.name}`}>
                           <Edit className="h-4 w-4" />
                         </Button>
-                        <Button variant="ghost" size="sm" onClick={() => handleDelete(f.id)} className="text-danger-600 hover:text-danger-700">
+                        <Button variant="ghost" size="sm" onClick={() => handleDelete(f.id)} aria-label={`Delete ${f.name}`} className="text-danger-600 hover:text-danger-700">
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>

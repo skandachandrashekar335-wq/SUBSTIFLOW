@@ -360,22 +360,27 @@ export function MasterTimetable() {
           <p className="text-secondary-500">{currentAcademicYear.name}</p>
         </div>
         <Button onClick={() => {
-          // QA-012: Time Slot / Section / Room render without a placeholder,
-          // so their first option is always visible. Initialize the state to
-          // exactly those displayed values — a save can never contradict what
-          // the dialog shows (the grid's class filter wins for Section).
+          // QA-011 + QA-012: every Add Entry open starts a genuinely fresh
+          // draft. Faculty/Subject/Day/Class Type are reset (a cancelled or
+          // edited draft must never leak into the next one) and Time
+          // Slot/Section/Room are initialized to exactly what their selects
+          // display (first option, or the grid's class filter for Section) —
+          // displayed values, form state and submitted values always agree.
           setEditingEntry(null)
           setFormError(null)
           setQuickContext(null)
-          setFormData(prev => ({
-            ...prev,
+          setFormData({
+            dayOfWeek: workingDays[0] ?? 'MONDAY',
             ...buildAddEntryDefaults({
               selectedSectionId: selectedSection,
               teachingSlots,
               sections,
               rooms,
             }),
-          }))
+            facultyId: '',
+            subjectId: '',
+            classType: 'LECTURE',
+          })
           setShowForm(true)
         }}>
           <Plus className="h-4 w-4" />

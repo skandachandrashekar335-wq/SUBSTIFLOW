@@ -155,8 +155,8 @@ export function Subjects() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Button variant="ghost" size="sm" onClick={() => handleEdit(s)}><Edit className="h-4 w-4" /></Button>
-                    <Button variant="ghost" size="sm" onClick={() => handleDelete(s.id)} className="text-danger-600 hover:text-danger-700"><Trash2 className="h-4 w-4" /></Button>
+                    <Button variant="ghost" size="sm" onClick={() => handleEdit(s)} aria-label={`Edit ${s.name}`}><Edit className="h-4 w-4" /></Button>
+                    <Button variant="ghost" size="sm" onClick={() => handleDelete(s.id)} aria-label={`Delete subject ${s.name}`} className="text-danger-600 hover:text-danger-700"><Trash2 className="h-4 w-4" /></Button>
                   </div>
                 </div>
               ))}

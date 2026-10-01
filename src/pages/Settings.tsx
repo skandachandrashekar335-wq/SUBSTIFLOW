@@ -390,25 +390,54 @@ export function Settings() {
         )}
       </div>
 
-      <div className="flex gap-1 border-b border-secondary-200 overflow-x-auto">
+      {/* QA-039: proper tablist/tab/panel semantics + arrow-key navigation. */}
+      <div
+        role="tablist"
+        aria-label="Settings sections"
+        className="flex gap-1 border-b border-secondary-200 overflow-x-auto"
+        onKeyDown={(e) => {
+          if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return
+          e.preventDefault()
+          const current = tabs.findIndex(t => t.id === activeTab)
+          const next =
+            e.key === 'ArrowRight'
+              ? (current + 1) % tabs.length
+              : (current - 1 + tabs.length) % tabs.length
+          setActiveTab(tabs[next].id as typeof activeTab)
+          setTimeout(() => document.getElementById(`settings-tab-${tabs[next].id}`)?.focus(), 0)
+        }}
+      >
         {tabs.map(tab => (
           <button
             key={tab.id}
+            id={`settings-tab-${tab.id}`}
+            role="tab"
+            aria-selected={activeTab === tab.id}
+            aria-controls={`settings-panel-${tab.id}`}
+            tabIndex={activeTab === tab.id ? 0 : -1}
             onClick={() => setActiveTab(tab.id as any)}
             className={cn(
-              'flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 -mb-px whitespace-nowrap transition-colors',
+              'flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 -mb-px whitespace-nowrap transition-colors focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-inset',
               activeTab === tab.id
                 ? 'border-primary-600 text-primary-700'
                 : 'border-transparent text-secondary-500 hover:text-secondary-700'
             )}
           >
-            <tab.icon className="h-4 w-4" />
+            <tab.icon className="h-4 w-4" aria-hidden="true" />
             {tab.label}
           </button>
         ))}
       </div>
 
-      {activeTab === 'general' && (
+      {/* All four tabpanels stay mounted (hidden when inactive) so every
+          tab's aria-controls resolves to a real element. */}
+      <div
+        role="tabpanel"
+        id="settings-panel-general"
+        aria-labelledby="settings-tab-general"
+        tabIndex={0}
+        hidden={activeTab !== 'general'}
+      >
         <Card>
           <CardHeader>
             <h3 className="text-lg font-semibold text-secondary-900">Institution Details</h3>
@@ -424,10 +453,16 @@ export function Settings() {
             </div>
           </CardBody>
         </Card>
-      )}
+        </div>
 
-      {activeTab === 'hours' && (
-        <div className="space-y-4">
+      <div
+        role="tabpanel"
+        id="settings-panel-hours"
+        aria-labelledby="settings-tab-hours"
+        tabIndex={0}
+        className="space-y-4"
+        hidden={activeTab !== 'hours'}
+      >
           <Card>
             <CardHeader>
               <h3 className="text-lg font-semibold text-secondary-900">Working Hours</h3>
@@ -513,7 +548,7 @@ export function Settings() {
                       <Button variant="ghost" size="sm" onClick={() => handleMoveSlot(slot.id, 1)} disabled={index === slots.length - 1} aria-label="Move down">
                         <ArrowDown className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => openEditSlot(slot)}>
+                      <Button variant="ghost" size="sm" onClick={() => openEditSlot(slot)} aria-label={`Edit period ${slot.name}`}>
                         <Edit className="h-4 w-4" />
                       </Button>
                       <Button variant="ghost" size="sm" onClick={() => handleDeleteSlot(slot.id)} className="text-danger-600" aria-label="Delete period">
@@ -551,10 +586,15 @@ export function Settings() {
             </CardBody>
           </Card>
         </div>
-      )}
 
-      {activeTab === 'academic' && (
-        <div className="space-y-4">
+      <div
+        role="tabpanel"
+        id="settings-panel-academic"
+        aria-labelledby="settings-tab-academic"
+        tabIndex={0}
+        className="space-y-4"
+        hidden={activeTab !== 'academic'}
+      >
           <Card>
             <CardHeader className="flex items-center justify-between">
               <div>
@@ -583,10 +623,10 @@ export function Settings() {
                       {!y.isActive && (
                         <Button variant="outline" size="sm" onClick={() => handleSetActiveYear(y.id)}>Set Active</Button>
                       )}
-                      <Button variant="ghost" size="sm" onClick={() => { setEditingYear(y); setYearForm({ name: y.name, startDate: y.startDate, endDate: y.endDate }); setShowYearForm(true) }}>
+                      <Button variant="ghost" size="sm" aria-label={`Edit academic year ${y.name}`} onClick={() => { setEditingYear(y); setYearForm({ name: y.name, startDate: y.startDate, endDate: y.endDate }); setShowYearForm(true) }}>
                         <Edit className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => handleDeleteYear(y.id)} className="text-danger-600">
+                      <Button variant="ghost" size="sm" onClick={() => handleDeleteYear(y.id)} aria-label={`Delete academic year ${y.name}`} className="text-danger-600">
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
@@ -621,10 +661,10 @@ export function Settings() {
                       {d.description && <p className="text-sm text-secondary-500">{d.description}</p>}
                     </div>
                     <div className="flex items-center gap-2">
-                      <Button variant="ghost" size="sm" onClick={() => { setEditingDept(d); setDeptForm({ name: d.name, code: d.code, description: d.description || '' }); setShowDeptForm(true) }}>
+                      <Button variant="ghost" size="sm" aria-label={`Edit department ${d.name}`} onClick={() => { setEditingDept(d); setDeptForm({ name: d.name, code: d.code, description: d.description || '' }); setShowDeptForm(true) }}>
                         <Edit className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => handleDeleteDept(d.id)} className="text-danger-600">
+                      <Button variant="ghost" size="sm" onClick={() => handleDeleteDept(d.id)} aria-label={`Delete department ${d.name}`} className="text-danger-600">
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
@@ -634,9 +674,14 @@ export function Settings() {
             </CardBody>
           </Card>
         </div>
-      )}
 
-      {activeTab === 'rules' && (
+      <div
+        role="tabpanel"
+        id="settings-panel-rules"
+        aria-labelledby="settings-tab-rules"
+        tabIndex={0}
+        hidden={activeTab !== 'rules'}
+      >
         <Card>
           <CardHeader>
             <h3 className="text-lg font-semibold text-secondary-900">Substitution Priority Weights</h3>
@@ -702,7 +747,7 @@ export function Settings() {
             </div>
           </CardBody>
         </Card>
-      )}
+        </div>
 
       <Dialog open={showYearForm} onOpenChange={setShowYearForm}>
         <DialogHeader title={editingYear ? 'Edit Academic Year' : 'Add Academic Year'} />
@@ -746,9 +791,11 @@ export function Settings() {
             onChange={(e) => setSlotForm(prev => ({ ...prev, name: e.target.value }))}
             placeholder="e.g., 16:00-17:00 (defaults from the times)"
           />
+          {/* QA-005: explicit ids — label-derived ids would collide with the
+              Working Hours tab's Start Time / End Time inputs (both visible). */}
           <div className="grid grid-cols-2 gap-4">
-            <Input label="Start Time" type="time" value={slotForm.startTime} onChange={(e) => setSlotForm(prev => ({ ...prev, startTime: e.target.value }))} required />
-            <Input label="End Time" type="time" value={slotForm.endTime} onChange={(e) => setSlotForm(prev => ({ ...prev, endTime: e.target.value }))} required />
+            <Input id="slot-start-time" label="Start Time" type="time" value={slotForm.startTime} onChange={(e) => setSlotForm(prev => ({ ...prev, startTime: e.target.value }))} required />
+            <Input id="slot-end-time" label="End Time" type="time" value={slotForm.endTime} onChange={(e) => setSlotForm(prev => ({ ...prev, endTime: e.target.value }))} required />
           </div>
           <Checkbox
             label="This is a break period (no classes or substitutions)"

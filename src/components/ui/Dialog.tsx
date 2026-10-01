@@ -1,4 +1,4 @@
-import { Fragment, ReactNode } from 'react'
+import { Fragment, ReactNode, useEffect } from 'react'
 import { X } from 'lucide-react'
 import { cn } from '@/utils/cn'
 
@@ -12,6 +12,20 @@ interface DialogProps {
 }
 
 export function Dialog({ open, onOpenChange, title, description, children, className }: DialogProps) {
+  // Escape closes the dialog (QA-040). The overlay makes dialogs mutually
+  // exclusive, so only one listener is ever active for the visible dialog.
+  useEffect(() => {
+    if (!open) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onOpenChange(false)
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [open, onOpenChange])
+
   if (!open) return null
 
   return (

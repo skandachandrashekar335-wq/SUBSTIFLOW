@@ -1,9 +1,9 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { format } from 'date-fns'
 import { 
   Calendar, RefreshCw, CheckCircle, XCircle, AlertTriangle, 
-  Lock, Unlock, Edit, Trash2, Download, Eye, Plus
+  Lock, Unlock, Edit, Trash2, Download, Eye, Plus, Table2
 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Card, CardHeader, CardBody } from '@/components/ui/Card'
@@ -20,11 +20,13 @@ import {
   approveSubstitutionRun,
   availableSubstitutesForAssignment,
   validateSubstituteAssignment,
+  getRevisedTimetable,
 } from '@/services/substitution'
 import { cn } from '@/utils/cn'
 
 export function SubstitutionPlanner() {
   const { currentAcademicYear, currentDate, setCurrentDate } = useAppStore()
+  const [searchParams, setSearchParams] = useSearchParams()
   
   const [runData, setRunData] = useState<any>(null)
   const [generating, setGenerating] = useState(false)
@@ -35,6 +37,17 @@ export function SubstitutionPlanner() {
 
   const today = currentDate || format(new Date(), 'yyyy-MM-dd')
 
+  // QA-028: the Dashboard's "Recent Substitution Runs" links carry the run's
+  // date (?date=…) — apply it once, then clear the param so the URL stays
+  // canonical and the planner's own date picker keeps working normally.
+  useEffect(() => {
+    const param = searchParams.get('date')
+    if (param && /^\d{4}-\d{2}-\d{2}$/.test(param)) {
+      setCurrentDate(param)
+      setSearchParams({}, { replace: true })
+    }
+  }, [searchParams, setCurrentDate, setSearchParams])
+
   useEffect(() => {
     loadRun()
   }, [today])
@@ -44,8 +57,20 @@ export function SubstitutionPlanner() {
     setRunData(run)
   }
 
+  const isApproved = runData?.status === 'APPROVED'
+
   const handleGenerate = async () => {
     if (!currentAcademicYear) return
+    // Phase 8: regenerating an APPROVED plan is an intentional override —
+    // never silent.
+    if (
+      isApproved &&
+      !confirm(
+        `This plan for ${dayName} has already been APPROVED.\n\nRegenerating replaces it with a new plan and clears the approval (locked assignments survive). Continue?`
+      )
+    ) {
+      return
+    }
     setGenerating(true)
     try {
       const result = generateSubstitutions(today)
@@ -77,6 +102,15 @@ export function SubstitutionPlanner() {
   }
 
   const handleUpdateAssignment = (assignmentId: string, facultyId: string | null) => {
+    // Phase 8: editing an APPROVED plan is an intentional override — the run
+    // reopens (APPROVED → GENERATED) once the change lands.
+    if (
+      isApproved &&
+      !confirm('This plan is APPROVED. Changing an assignment reopens the plan for review (status returns to GENERATED). Continue?')
+    ) {
+      loadRun()
+      return
+    }
     // A hand-picked substitute must satisfy the same hard constraints as the
     // generated plan: not absent, not already teaching or covering another
     // class in this slot, and not past the daily limit.
@@ -100,6 +134,9 @@ export function SubstitutionPlanner() {
   }
 
   const handleLock = (assignmentId: string) => {
+    if (isApproved && !confirm('This plan is APPROVED. Locking an assignment reopens the plan for review. Continue?')) {
+      return
+    }
     if (!lockAssignment(assignmentId)) {
       alert('Could not lock this assignment. Reload the page and try again.')
       return
@@ -108,6 +145,9 @@ export function SubstitutionPlanner() {
   }
 
   const handleUnlock = (assignmentId: string) => {
+    if (isApproved && !confirm('This plan is APPROVED. Unlocking an assignment reopens the plan for review. Continue?')) {
+      return
+    }
     if (!unlockAssignment(assignmentId)) {
       alert('Could not unlock this assignment. Reload the page and try again.')
       return
@@ -129,6 +169,14 @@ export function SubstitutionPlanner() {
     [selectedAssignment, runData]
   )
 
+  // QA-026: the revised day timetable (master entries + substitutions) has a
+  // real consumer right here — reachable in the normal coordinator workflow.
+  // Recomputed whenever the run data changes (generate / edit / approve).
+  const revisedTimetable = useMemo(
+    () => (currentAcademicYear ? getRevisedTimetable(today) : []),
+    [today, currentAcademicYear, runData]
+  )
+
   const dayName = new Date(today + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
 
   if (!currentAcademicYear) {
@@ -146,8 +194,18 @@ export function SubstitutionPlanner() {
     <div className="max-w-7xl mx-auto space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-secondary-900">Substitution Planner</h1>
-          <p className="text-secondary-500">Generate and review substitutions for {dayName}</p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="text-2xl font-bold text-secondary-900">Substitution Planner</h1>
+            {runData && (
+              <Badge variant={isApproved ? 'success' : 'info'}>
+                {isApproved ? 'APPROVED' : runData.status}
+              </Badge>
+            )}
+          </div>
+          <p className="text-secondary-500">
+            Generate and review substitutions for {dayName}
+            {isApproved && runData.approvedBy ? ` — approved by ${runData.approvedBy}` : ''}
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <input
@@ -180,9 +238,9 @@ export function SubstitutionPlanner() {
         <Card>
           <CardBody className="flex flex-col items-center justify-center py-12 text-center">
             <Calendar className="h-12 w-12 text-secondary-300 mb-4" />
-            <h3 className="text-lg font-medium text-secondary-900 mb-2">No substitution plan for today</h3>
+            <h3 className="text-lg font-medium text-secondary-900 mb-2">No substitution plan for this date</h3>
             <p className="text-secondary-500 mb-6 max-w-md">
-              Click "Generate Plan" to automatically create substitutions based on today's absent faculty.
+              Click "Generate Plan" to automatically create substitutions based on the absent faculty for {dayName}.
             </p>
             <Button onClick={handleGenerate} disabled={generating} loading={generating} size="lg">
               <Plus className="h-4 w-4" />
@@ -204,6 +262,12 @@ export function SubstitutionPlanner() {
             <div className="space-y-3">
               {runData.uncovered.map((uncovered: any, index: number) => {
                 const entry = runData.affectedEntries.find((e: any) => e.id === uncovered.originalEntryId)
+                // QA-021: uncovered rows are persisted as real assignment rows
+                // (substitute = null) — the picker must open against THAT row,
+                // not a synthetic id:'' object the validator can never resolve.
+                const uncoveredAssignment = runData.assignments.find(
+                  (a: any) => a.originalEntryId === uncovered.originalEntryId
+                )
                 return (
                   <div key={index} className="p-4 bg-white border border-danger-200 rounded-lg">
                     <div className="flex items-start justify-between gap-4">
@@ -219,19 +283,8 @@ export function SubstitutionPlanner() {
                       <Button 
                         variant="outline" 
                         size="sm" 
-                        onClick={() => handleOpenManualAssign({
-                          id: '',
-                          runId: runData.runId,
-                          originalEntryId: uncovered.originalEntryId,
-                          substituteFacultyId: null,
-                          status: 'PENDING',
-                          score: 0,
-                          reasoning: '',
-                          isLocked: false,
-                          createdAt: '',
-                          updatedAt: '',
-                          originalEntry: entry,
-                        })}
+                        disabled={!uncoveredAssignment}
+                        onClick={() => uncoveredAssignment && handleOpenManualAssign(uncoveredAssignment)}
                       >
                         <Plus className="h-4 w-4" />
                         Assign Manually
@@ -251,10 +304,14 @@ export function SubstitutionPlanner() {
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-semibold text-secondary-900">Generated Substitutions ({runData.assignments.length})</h3>
               {runData.statistics.uncovered === 0 && (
-                <Button onClick={handleApprove} disabled={approving} loading={approving} variant="success">
-                  <CheckCircle className="h-4 w-4" />
-                  Approve Plan
-                </Button>
+                isApproved ? (
+                  <Badge variant="success">Approved{runData.approvedBy ? ` by ${runData.approvedBy}` : ''}</Badge>
+                ) : (
+                  <Button onClick={handleApprove} disabled={approving} loading={approving} variant="success">
+                    <CheckCircle className="h-4 w-4" />
+                    Approve Plan
+                  </Button>
+                )
               )}
             </div>
           </CardHeader>
@@ -271,6 +328,65 @@ export function SubstitutionPlanner() {
                   availableFaculty={availableSubstitutesForAssignment(assignment.id)}
                 />
               ))}
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
+      {runData && revisedTimetable.length > 0 && (
+        <Card data-testid="revised-timetable">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Table2 className="h-5 w-5 text-primary-600" aria-hidden="true" />
+              <h3 className="text-lg font-semibold text-secondary-900">Revised Timetable — {dayName}</h3>
+            </div>
+            <p className="text-sm text-secondary-500">
+              The full day view with substitutions applied (master timetable entries are never modified).
+            </p>
+          </CardHeader>
+          <CardBody className="p-0">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-secondary-50 text-secondary-600">
+                  <tr>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Period</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Class</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Subject</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Original Faculty</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Substitute</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Room</th>
+                    <th scope="col" className="text-left font-medium px-4 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-secondary-100">
+                  {revisedTimetable.map((row: any, index: number) => {
+                    const entry = row.originalEntry
+                    const substitution = row.substitution
+                    const status = row.isSubstituted
+                      ? (substitution?.isLocked ? 'Locked' : 'Substituted')
+                      : substitution
+                        ? 'Uncovered'
+                        : 'As Scheduled'
+                    return (
+                      <tr key={index} className={cn(substitution && (row.isSubstituted ? 'bg-primary-50/50' : 'bg-danger-50'))}>
+                        <td className="px-4 py-2 whitespace-nowrap text-secondary-700">{entry?.timeSlot?.name}</td>
+                        <td className="px-4 py-2 whitespace-nowrap text-secondary-900">{entry?.section?.name}</td>
+                        <td className="px-4 py-2 text-secondary-700">{entry?.subject?.name}</td>
+                        <td className="px-4 py-2 text-secondary-700">{entry?.faculty?.name}</td>
+                        <td className={cn('px-4 py-2', row.isSubstituted ? 'font-medium text-primary-700' : 'text-secondary-500')}>
+                          {row.substituteFaculty?.name || '—'}
+                        </td>
+                        <td className="px-4 py-2 text-secondary-700">{entry?.room?.name || '—'}</td>
+                        <td className="px-4 py-2">
+                          <Badge variant={status === 'Locked' ? 'warning' : status === 'Substituted' ? 'success' : status === 'Uncovered' ? 'danger' : 'neutral'}>
+                            {status}
+                          </Badge>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
             </div>
           </CardBody>
         </Card>
@@ -406,11 +522,11 @@ function AssignmentRow({
                 disabled={isLocked}
               />
               {isLocked ? (
-                <Button variant="ghost" size="sm" onClick={() => onUnlock(assignment.id)}>
+                <Button variant="ghost" size="sm" aria-label="Unlock this substitution" onClick={() => onUnlock(assignment.id)}>
                   <Unlock className="h-3 w-3" />
                 </Button>
               ) : (
-                <Button variant="ghost" size="sm" onClick={() => onLock(assignment.id)}>
+                <Button variant="ghost" size="sm" aria-label="Lock this substitution" onClick={() => onLock(assignment.id)}>
                   <Lock className="h-3 w-3" />
                 </Button>
               )}

@@ -154,7 +154,7 @@ export function Rooms() {
                       <Button variant="outline" size="sm" onClick={() => handleEdit(r)} className="flex-1">
                         <Edit className="h-4 w-4" /> Edit
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => handleDelete(r.id)} className="text-danger-600">
+                      <Button variant="ghost" size="sm" onClick={() => handleDelete(r.id)} aria-label={`Delete room ${r.name}`} className="text-danger-600">
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
