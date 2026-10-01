@@ -21,6 +21,7 @@ import type {
   TimetableEntry,
   TimetableEntryWithRelations,
   TimeSlot,
+  Section,
   Subject,
   Faculty,
   Room,
@@ -251,6 +252,34 @@ export function findFreeRoomId(params: {
   )
   const free = params.rooms.find(r => !booked.has(r.id))
   return (free ?? params.rooms[0])?.id ?? ''
+}
+
+/**
+ * Initial Time Slot / Section / Room for the full "Add Entry" dialog
+ * (QA-012).
+ *
+ * Those three selects render without a placeholder option, so the browser
+ * displays their FIRST option. The form state must be initialized to exactly
+ * those values — otherwise the dialog shows a concrete period/class/room while
+ * the state is `''`, and saving fails with "Time period / Section / Room is
+ * required" for values the coordinator can see on screen.
+ *
+ * `selectedSectionId` (the grid's class filter) wins over the first section,
+ * matching what the dialog displays when a class context is active.
+ * DISPLAYED VALUE === FORM STATE === SUBMITTED VALUE by construction: the
+ * same arrays are passed to the dialog's option lists.
+ */
+export function buildAddEntryDefaults(params: {
+  selectedSectionId?: string
+  teachingSlots: TimeSlot[]
+  sections: Section[]
+  rooms: Room[]
+}): { timeSlotId: string; sectionId: string; roomId: string } {
+  return {
+    timeSlotId: params.teachingSlots[0]?.id ?? '',
+    sectionId: params.selectedSectionId || params.sections[0]?.id || '',
+    roomId: params.rooms[0]?.id ?? '',
+  }
 }
 
 // ---------------------------------------------------------------------------

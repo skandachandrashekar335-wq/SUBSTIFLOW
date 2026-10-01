@@ -15,6 +15,7 @@ import {
   deleteTimetableEntry,
   resolveCellAction,
   buildQuickEntryInput,
+  buildAddEntryDefaults,
   findFreeRoomId,
   subjectsForFaculty,
   facultyForSubject,
@@ -358,7 +359,25 @@ export function MasterTimetable() {
           <h1 className="text-2xl font-bold text-secondary-900">Master Timetable</h1>
           <p className="text-secondary-500">{currentAcademicYear.name}</p>
         </div>
-        <Button onClick={() => { setEditingEntry(null); setFormError(null); setQuickContext(null); setFormData(prev => ({ ...prev, sectionId: selectedSection || prev.sectionId })); setShowForm(true); }}>
+        <Button onClick={() => {
+          // QA-012: Time Slot / Section / Room render without a placeholder,
+          // so their first option is always visible. Initialize the state to
+          // exactly those displayed values — a save can never contradict what
+          // the dialog shows (the grid's class filter wins for Section).
+          setEditingEntry(null)
+          setFormError(null)
+          setQuickContext(null)
+          setFormData(prev => ({
+            ...prev,
+            ...buildAddEntryDefaults({
+              selectedSectionId: selectedSection,
+              teachingSlots,
+              sections,
+              rooms,
+            }),
+          }))
+          setShowForm(true)
+        }}>
           <Plus className="h-4 w-4" />
           Add Entry
         </Button>

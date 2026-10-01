@@ -25,6 +25,9 @@
  *     truth: write, close, reopen, read)
  * 18. Faculty deletion actually deletes (and cascades mappings/attendance),
  *     with a friendly guard for faculty scheduled in the timetable
+ * 19. QA-012: the Add Entry dialog's displayed Time Slot / Section / Room are
+ *     the actual form state — what the selects show is what gets submitted
+ *     (and validation still rejects a truly empty state)
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
@@ -46,6 +49,7 @@ import {
   createTimetableEntry,
   updateTimetableEntry,
   deleteTimetableEntry,
+  buildAddEntryDefaults,
 } from '@/services/timetable'
 
 let testDb: Database.Database | null = null
@@ -489,5 +493,108 @@ describe('regression: faculty deletion', () => {
 
   it('deleting a faculty member who no longer exists returns false instead of crashing', () => {
     expect(facultyRepository.delete('fac-missing')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 19. QA-012: Add Entry form state === displayed selects === submitted values
+// ---------------------------------------------------------------------------
+describe('QA-012: add entry form state matches the displayed selects', () => {
+  const teachingSlots = () => timeSlotRepository.getOrdered().filter(s => !s.isBreak)
+  const yearSections = () => sectionRepository.findByAcademicYear('year-1')
+  const allRooms = () => roomRepository.findAll()
+  const defaultsFor = (selectedSectionId?: string) =>
+    buildAddEntryDefaults({
+      selectedSectionId,
+      teachingSlots: teachingSlots(),
+      sections: yearSections(),
+      rooms: allRooms(),
+    })
+
+  it('initializes Time Slot / Section / Room state to exactly the first option the dialog displays', () => {
+    const slots = teachingSlots()
+    const sections = yearSections()
+    const rooms = allRooms()
+    // The dialog renders these same arrays as the select options and the
+    // browser shows options[0] — the state must be that same first option,
+    // never '' (the QA-012 contradiction: displayed value, empty state).
+    const defaults = defaultsFor()
+    expect(defaults.timeSlotId).toBe(slots[0].id)
+    expect(defaults.sectionId).toBe(sections[0].id)
+    expect(defaults.roomId).toBe(rooms[0].id)
+    expect(defaults.timeSlotId).not.toBe('')
+    expect(defaults.sectionId).not.toBe('')
+    expect(defaults.roomId).not.toBe('')
+    // Break periods are never offered (and never defaulted to).
+    expect(slots.some(s => s.id === defaults.timeSlotId && s.isBreak)).toBe(false)
+  })
+
+  it("the grid's active class filter wins for Section (context-aware open)", () => {
+    const sections = yearSections()
+    const defaults = defaultsFor(sections[1].id)
+    expect(defaults.sectionId).toBe(sections[1].id)
+    // The other two fields still display-first-option defaults.
+    expect(defaults.timeSlotId).toBe(teachingSlots()[0].id)
+    expect(defaults.roomId).toBe(allRooms()[0].id)
+  })
+
+  it('submitting with the initialized defaults succeeds and persists those exact values', () => {
+    const defaults = defaultsFor()
+    const created = createTimetableEntry(
+      {
+        dayOfWeek: 'WEDNESDAY',
+        ...defaults,
+        subjectId: 'sub-1',
+        facultyId: 'fac-1',
+        classType: 'LECTURE',
+      } as Parameters<typeof createTimetableEntry>[0],
+      'year-1'
+    )
+    expect(created.id).toBeTruthy()
+
+    const saved = timetableEntryRepository.getWithRelations('year-1').find(e => e.id === created.id)
+    expect(saved).toBeTruthy()
+    expect(saved!.timeSlotId).toBe(defaults.timeSlotId)
+    expect(saved!.sectionId).toBe(defaults.sectionId)
+    expect(saved!.roomId).toBe(defaults.roomId)
+
+    // Source of truth: read the persisted row straight from SQLite.
+    const row = testDb!
+      .prepare('SELECT time_slot_id, section_id, room_id FROM timetable_entries WHERE id = ?')
+      .get(created.id) as { time_slot_id: string; section_id: string; room_id: string }
+    expect(row.time_slot_id).toBe(defaults.timeSlotId)
+    expect(row.section_id).toBe(defaults.sectionId)
+    expect(row.room_id).toBe(defaults.roomId)
+  })
+
+  it('validation still rejects a genuinely empty state with the exact QA-012 messages (not weakened)', () => {
+    let message = ''
+    try {
+      createTimetableEntry(
+        {
+          dayOfWeek: 'WEDNESDAY',
+          ...defaultsFor(),
+          timeSlotId: '',
+          sectionId: '',
+          roomId: '',
+          subjectId: 'sub-1',
+          facultyId: 'fac-1',
+          classType: 'LECTURE',
+        } as Parameters<typeof createTimetableEntry>[0],
+        'year-1'
+      )
+    } catch (e: any) {
+      message = e.message
+    }
+    expect(message).toMatch(/Time period is required/)
+    expect(message).toMatch(/Section is required/)
+    expect(message).toMatch(/Room is required/)
+    expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(0)
+  })
+
+  it('with no data at all the defaults stay empty (no fabricated values)', () => {
+    expect(
+      buildAddEntryDefaults({ teachingSlots: [], sections: [], rooms: [] })
+    ).toEqual({ timeSlotId: '', sectionId: '', roomId: '' })
   })
 })
