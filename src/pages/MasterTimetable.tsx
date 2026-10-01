@@ -421,13 +421,25 @@ export function MasterTimetable() {
 
       <Card>
         <CardBody className="p-0 overflow-auto">
-          <div className="grid" style={{ gridTemplateColumns: `80px repeat(${allSlots.length}, 1fr)`, gap: '2px' }}>
-            <div className="p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">Day / Time</div>
+          {/* ONE grid renders header and body, so both share identical track
+              definitions and every column boundary lines up from the header
+              through every day row. `minmax(140px, 1fr)` keeps all period
+              columns equal and content-independent: the fixed minimum cannot
+              be widened by long (nowrap, truncated) text, and it preserves a
+              useful minimum column width — narrower viewports scroll
+              horizontally instead of squashing the columns. No column gap:
+              neighbouring cells' borders touch so the grid reads as one
+              table rather than a field of floating cards. */}
+          <div
+            className="grid"
+            style={{ gridTemplateColumns: `96px repeat(${allSlots.length}, minmax(140px, 1fr))` }}
+          >
+            <div className="min-w-0 p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">Day / Time</div>
             {allSlots.map(slot => (
               <div
                 key={slot.id}
                 className={cn(
-                  'p-2 border font-semibold text-center text-xs',
+                  'min-w-0 p-2 border font-semibold text-center text-xs',
                   slot.isBreak
                     ? 'bg-warning-50 border-warning-200 text-warning-700'
                     : 'bg-secondary-50 border-secondary-200 text-secondary-700'
@@ -442,13 +454,13 @@ export function MasterTimetable() {
               const day = DAYS_OF_WEEK.find(d => d.value === dayValue)
               return (
                 <div key={dayValue} className="contents">
-                  <div className="p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">{day?.label ?? dayValue}</div>
+                  <div className="min-w-0 p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">{day?.label ?? dayValue}</div>
                   {allSlots.map(slot => {
                     if (slot.isBreak) {
                       return (
                         <div
                           key={`${dayValue}-${slot.id}`}
-                          className="min-h-[70px] border border-warning-200 bg-warning-50 flex items-center justify-center text-[10px] font-bold text-warning-700"
+                          className="min-h-[70px] min-w-0 border border-warning-200 bg-warning-50 flex items-center justify-center text-[10px] font-bold text-warning-700"
                         >
                           BREAK
                         </div>
@@ -458,36 +470,43 @@ export function MasterTimetable() {
                     return (
                       <div
                         key={`${dayValue}-${slot.id}`}
-                        className="relative min-h-[70px] p-1.5 border border-secondary-200 cursor-pointer hover:bg-secondary-50 transition-colors text-xs bg-white"
+                        className="min-h-[70px] min-w-0 p-1.5 border border-secondary-200 cursor-pointer hover:bg-secondary-50 transition-colors text-xs bg-white flex flex-col"
                         onClick={() => handleCellClick(dayValue as DayOfWeek, slot.id)}
                       >
-                        {cellEntries.map(entry => (
-                          <div
-                            key={entry.id}
-                            className={cn(
-                              'mb-1 last:mb-0 rounded border px-1 py-0.5 cursor-pointer hover:border-primary-300 transition-colors',
-                              entry.classType === 'LAB' ? 'bg-blue-50 border-blue-200' : 'bg-secondary-50 border-secondary-200'
-                            )}
-                            onClick={(e) => { e.stopPropagation(); handleEdit(entry) }}
-                          >
-                            <div className="font-medium truncate">{entry.section?.name}</div>
-                            <div className="truncate text-secondary-600">{entry.subject?.name}</div>
-                            <div className="truncate text-secondary-500">{entry.faculty?.name}</div>
-                            <div className="truncate text-secondary-400">{entry.room?.name}</div>
-                            <Badge variant="neutral" className="mt-0.5">{entry.classType}</Badge>
-                          </div>
-                        ))}
-                        {cellEntries.length > 0 && (
-                          <button
-                            type="button"
-                            title="Add another class to this period"
-                            aria-label="Add another class to this period"
-                            className="absolute top-0.5 right-0.5 h-5 w-5 rounded-full bg-white/90 border border-secondary-300 text-secondary-500 hover:text-primary-600 hover:border-primary-400 flex items-center justify-center"
-                            onClick={(e) => { e.stopPropagation(); openQuickEntry(dayValue as DayOfWeek, slot.id) }}
-                          >
-                            <Plus className="h-3 w-3" />
-                          </button>
-                        )}
+                        {/* Entries stack in a centred inner track: the row height
+                            comes from the tallest cell of the row, so a lone
+                            entry balances instead of leaving a lopsided gap.
+                            min-w-0 + truncate keeps long names inside the cell. */}
+                        <div className="flex-1 flex flex-col justify-center gap-1">
+                          {cellEntries.map(entry => (
+                            <div
+                              key={entry.id}
+                              className={cn(
+                                'rounded border px-1.5 py-1 cursor-pointer hover:border-primary-300 transition-colors min-w-0',
+                                entry.classType === 'LAB' ? 'bg-blue-50 border-blue-200' : 'bg-secondary-50 border-secondary-200'
+                              )}
+                              onClick={(e) => { e.stopPropagation(); handleEdit(entry) }}
+                            >
+                              <div className="font-medium truncate" title={entry.section?.name}>{entry.section?.name}</div>
+                              <div className="truncate text-secondary-600" title={entry.subject?.name}>{entry.subject?.name}</div>
+                              <div className="truncate text-secondary-500" title={entry.faculty?.name}>{entry.faculty?.name}</div>
+                              <div className="truncate text-secondary-400" title={entry.room?.name}>{entry.room?.name}</div>
+                              <Badge variant="neutral" className="mt-0.5">{entry.classType}</Badge>
+                            </div>
+                          ))}
+                        </div>
+                        {/* One consistent placement for every cell (empty or not):
+                            bottom-right, in normal flow, so it can never sit on
+                            top of a card. */}
+                        <button
+                          type="button"
+                          title={cellEntries.length > 0 ? 'Add another class to this period' : 'Add class to this period'}
+                          aria-label={cellEntries.length > 0 ? 'Add another class to this period' : 'Add class to this period'}
+                          className="mt-auto self-end h-5 w-5 shrink-0 rounded-full bg-white/90 border border-secondary-300 text-secondary-500 hover:text-primary-600 hover:border-primary-400 flex items-center justify-center"
+                          onClick={(e) => { e.stopPropagation(); openQuickEntry(dayValue as DayOfWeek, slot.id) }}
+                        >
+                          <Plus className="h-3 w-3" />
+                        </button>
                       </div>
                     )
                   })}
