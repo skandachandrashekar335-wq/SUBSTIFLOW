@@ -2,13 +2,13 @@ import { app, BrowserWindow, ipcMain, dialog, shell, Menu } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs'
 import { createDatabase, openNodeDatabase, resolveDatabasePath } from '../src/db/nodeDb'
+import { validateBackupFile } from './backupValidation'
 import type { SqlDatabase } from '../src/db/types'
 
 const isDev = process.env.NODE_ENV === 'development' && !app.isPackaged
 
 // Fixed storage folder shared with the maintenance CLI (`scripts/cli.js`).
 app.setName('SubstiFlow')
-
 let mainWindow: BrowserWindow | null = null
 let db: SqlDatabase | null = null
 
@@ -18,6 +18,29 @@ function ok(data: unknown): { data: unknown } {
 
 function fail(error: unknown): { error: string } {
   return { error: error instanceof Error ? error.message : String(error) }
+}
+
+/**
+ * Only the main window's renderer may call our IPC handlers — a defence in
+ * depth against any other webContents (popups, print windows, devtools
+ * extensions) reaching the database bridge.
+ */
+function isTrustedSender(event: { sender: unknown }): boolean {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents)
+}
+
+/** External links: only harmless web schemes ever reach the OS handler. */
+function openExternalSafely(url: string): void {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'mailto:') {
+      void shell.openExternal(url)
+    } else {
+      console.warn(`[app] blocked external open of ${parsed.protocol} URL`)
+    }
+  } catch {
+    console.warn('[app] blocked external open of malformed URL')
+  }
 }
 
 /**
@@ -90,6 +113,10 @@ async function runAutoBackup(): Promise<void> {
 function setupIpc(): void {
   const handle = (channel: string, fn: (payload: any) => unknown) => {
     ipcMain.on(channel, (event, payload) => {
+      if (!isTrustedSender(event)) {
+        event.returnValue = fail('IPC sender is not the main window')
+        return
+      }
       if (!db) {
         event.returnValue = fail('Database is not initialised')
         return
@@ -116,7 +143,8 @@ function setupIpc(): void {
     return null
   })
 
-  ipcMain.handle('db:query', (_event, sql: string, params: unknown[] = []) => {
+  ipcMain.handle('db:query', (event, sql: string, params: unknown[] = []) => {
+    if (!isTrustedSender(event)) return fail('IPC sender is not the main window')
     if (!db) return fail('Database is not initialised')
     try {
       return ok(db.prepare(sql).all(...(params as unknown[])))
@@ -125,7 +153,8 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('db:transaction', (_event, sqls: { sql: string; params?: unknown[] }[]) => {
+  ipcMain.handle('db:transaction', (event, sqls: { sql: string; params?: unknown[] }[]) => {
+    if (!isTrustedSender(event)) return fail('IPC sender is not the main window')
     if (!db) return fail('Database is not initialised')
     try {
       // Real transaction: every statement commits together, or none do.
@@ -146,7 +175,8 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('backup:export', async () => {
+  ipcMain.handle('backup:export', async (event) => {
+    if (!isTrustedSender(event)) return { success: false, error: 'IPC sender is not the main window' }
     if (!db) return { success: false, error: 'Database is not initialised' }
 
     const { filePath, canceled } = await dialog.showSaveDialog({
@@ -166,9 +196,16 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('backup:import', async (_event, filePath: string) => {
+  ipcMain.handle('backup:import', async (event, filePath: string) => {
+    if (!isTrustedSender(event)) return { success: false, error: 'IPC sender is not the main window' }
     if (!filePath || !fs.existsSync(filePath)) {
       return { success: false, error: 'File not found' }
+    }
+    // The renderer passes an arbitrary path — never copy it over the live
+    // database without verifying it is a real, non-corrupt SQLite backup.
+    const validation = validateBackupFile(filePath)
+    if (!validation.ok) {
+      return { success: false, error: validation.error }
     }
 
     const { response } = await dialog.showMessageBox({
@@ -193,7 +230,8 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('backup:autoInfo', () => {
+  ipcMain.handle('backup:autoInfo', (event) => {
+    if (!isTrustedSender(event)) return { error: 'IPC sender is not the main window' }
     try {
       const snapshots = listAutoBackups()
       const last = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null
@@ -208,15 +246,19 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('app:info', () => ({
-    version: app.getVersion(),
-    name: app.getName(),
-    userDataPath: app.getPath('userData'),
-    dbPath: resolveDatabasePath(),
-    isDev,
-  }))
+  ipcMain.handle('app:info', (event) => {
+    if (!isTrustedSender(event)) return { error: 'IPC sender is not the main window' }
+    return {
+      version: app.getVersion(),
+      name: app.getName(),
+      userDataPath: app.getPath('userData'),
+      dbPath: resolveDatabasePath(),
+      isDev,
+    }
+  })
 
-  ipcMain.handle('print', async (_event, html?: string) => {
+  ipcMain.handle('print', async (event, html?: string) => {
+    if (!isTrustedSender(event)) return { success: false, error: 'IPC sender is not the main window' }
     const { filePath, canceled } = await dialog.showSaveDialog({
       title: 'Save as PDF',
       defaultPath: `substiflow-${localDateStamp()}.pdf`,
@@ -266,8 +308,22 @@ function createWindow(): void {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url)
+    openExternalSafely(url)
     return { action: 'deny' }
+  })
+
+  // The renderer must never leave the app: no remote navigation (which would
+  // hand the preload bridge to a hostile page). In-page router navigation
+  // (history.pushState) does not trigger will-navigate.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const allowed =
+      url.startsWith('about:') ||
+      (!isDev && url.startsWith('file://')) ||
+      (isDev && (url === 'http://localhost:5173/' || url.startsWith('http://localhost:5173/')))
+    if (!allowed) {
+      console.warn(`[app] blocked navigation to ${url}`)
+      event.preventDefault()
+    }
   })
 
   // Surface renderer console output and load failures in the terminal.
