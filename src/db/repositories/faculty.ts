@@ -123,6 +123,31 @@ export class FacultyRepository extends BaseRepository<Faculty> {
     `).all(subjectId) as any[]
     return rows.map(row => this.entityFromRow(row))
   }
+
+  /**
+   * Delete a faculty member.
+   *
+   * Timetable usage is checked first so the coordinator gets a friendly,
+   * countable message instead of a raw FOREIGN KEY failure (schema:
+   * `timetable_entries.faculty_id` is ON DELETE RESTRICT). Subject/section
+   * mappings and attendance rows cascade away; substitution history is kept
+   * with the substitute set to NULL.
+   */
+  delete(id: string): boolean {
+    const existing = this.findById(id)
+    if (!existing) return false
+    const usage = this.db()
+      .prepare('SELECT COUNT(*) as count FROM timetable_entries WHERE faculty_id = ?')
+      .get(id) as { count: number }
+    if (usage.count > 0) {
+      const n = usage.count
+      throw new Error(
+        `${existing.name} is still scheduled in ${n} timetable entr${n === 1 ? 'y' : 'ies'}. ` +
+          `Reassign or remove ${n === 1 ? 'it' : 'them'} first.`
+      )
+    }
+    return super.delete(id)
+  }
 }
 
 export const facultyRepository = new FacultyRepository()

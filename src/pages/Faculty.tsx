@@ -139,12 +139,19 @@ export function Faculty() {
   }
 
   const handleDelete = (id: string) => {
-    if (!confirm('Deactivate this faculty member?')) return
+    if (!confirm('Delete this faculty member? Their subject mappings, section mappings and attendance records will also be removed. A faculty member scheduled in the timetable cannot be deleted. This cannot be undone.')) return
     try {
-      facultyRepository.update(id, { isActive: false })
+      const removed = facultyRepository.delete(id)
+      if (!removed) {
+        alert('This faculty member no longer exists. The list has been refreshed.')
+      }
       setFacultyList(facultyRepository.findAll())
     } catch (error) {
-      alert(error instanceof Error ? error.message : 'Could not deactivate the faculty member.')
+      alert(
+        /FOREIGN KEY constraint failed/i.test(String(error))
+          ? 'This faculty member is still referenced and cannot be deleted.'
+          : error instanceof Error ? error.message : 'Could not delete the faculty member.'
+      )
     }
   }
 

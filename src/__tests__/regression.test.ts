@@ -23,6 +23,8 @@
  * 16. Mark-all-present never wipes existing notes
  * 17. Everything survives a simulated app restart (SQLite is the source of
  *     truth: write, close, reopen, read)
+ * 18. Faculty deletion actually deletes (and cascades mappings/attendance),
+ *     with a friendly guard for faculty scheduled in the timetable
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
@@ -438,5 +440,54 @@ describe('regression: persistence across an app restart', () => {
     fs.rmSync(dbFile, { force: true })
     fs.rmSync(dbFile + '-wal', { force: true })
     fs.rmSync(dbFile + '-shm', { force: true })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 18. Faculty deletion
+// ---------------------------------------------------------------------------
+describe('regression: faculty deletion', () => {
+  it('deletes an unused faculty member and cascades their mappings and attendance', () => {
+    facultyRepository.setSubjects('fac-2', [
+      { facultyId: 'fac-2', subjectId: 'sub-1', proficiency: 3 },
+    ])
+    facultyRepository.setSections('fac-2', ['sec-2'])
+    attendanceRepository.upsert('2024-09-25', 'fac-2', 'ABSENT')
+    expect(facultyRepository.findById('fac-2')).toBeTruthy()
+
+    expect(facultyRepository.delete('fac-2')).toBe(true)
+
+    expect(facultyRepository.findById('fac-2')).toBeNull()
+    const count = (table: string) =>
+      (
+        testDb!
+          .prepare(`SELECT COUNT(*) as c FROM ${table} WHERE faculty_id = ?`)
+          .get('fac-2') as { c: number }
+      ).c
+    expect(count('faculty_subjects')).toBe(0)
+    expect(count('faculty_sections')).toBe(0)
+    expect(count('attendance')).toBe(0)
+  })
+
+  it('refuses to delete a scheduled faculty member with a friendly message (row preserved)', () => {
+    createTimetableEntry(baseEntry(), 'year-1') // fac-1 is now in the timetable
+
+    let message = ''
+    try {
+      facultyRepository.delete('fac-1')
+    } catch (e: any) {
+      message = e.message
+    }
+
+    expect(message).toContain('Mrs. Ranjini')
+    expect(message).toMatch(/still scheduled in 1 timetable entry\./)
+    expect(message).not.toMatch(/FOREIGN KEY|SQLITE/i)
+    // Nothing was destroyed.
+    expect(facultyRepository.findById('fac-1')).toBeTruthy()
+    expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(1)
+  })
+
+  it('deleting a faculty member who no longer exists returns false instead of crashing', () => {
+    expect(facultyRepository.delete('fac-missing')).toBe(false)
   })
 })
