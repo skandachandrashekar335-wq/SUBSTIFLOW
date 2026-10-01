@@ -8,6 +8,89 @@ import { facultyRepository, settingsRepository } from '@/db/repositories'
 import { getDatabase } from '@/db/database'
 import { SubstitutionCandidate, FacultyAvailability, PriorityTier, PRIORITY_TIER_LABELS } from './types'
 
+function toMinutes(time: string): number {
+  const [h, m] = time.split(':').map(Number)
+  return (h || 0) * 60 + (m || 0)
+}
+
+/**
+ * A period that lies (even partially) outside the configured working hours
+ * can never receive a substitution — hard constraint (e), shared by
+ * generation and the manual-assignment validator.
+ */
+export function isOutsideWorkingHours(startTime?: string, endTime?: string): boolean {
+  if (!startTime || !endTime) return false
+  const hours = settingsRepository.getWorkingHours()
+  return toMinutes(startTime) < toMinutes(hours.startTime) || toMinutes(endTime) > toMinutes(hours.endTime)
+}
+
+/**
+ * Priority tier from the raw relationship flags (P1 same class → P5
+ * unrelated). Single source of truth: scoring uses it, and the manual
+ * assignment validator reuses it to enforce the "unrelated faculty only when
+ * allowed" configuration.
+ */
+export function priorityTierFor(flags: {
+  teachesSection: boolean
+  sameSemester: boolean
+  sameDepartment: boolean
+  teachesAnySection: boolean
+  isQualified: boolean
+  taughtBefore: boolean
+  teachesSubject: boolean
+}): PriorityTier {
+  return flags.teachesSection
+    ? 1
+    : flags.sameSemester
+      ? 2
+      : flags.sameDepartment && flags.teachesAnySection
+        ? 3
+        : flags.sameDepartment || flags.isQualified || flags.taughtBefore || flags.teachesSubject
+          ? 4
+          : 5
+}
+
+/**
+ * Is this faculty member unrelated (P5) to the given entry? Used by the
+ * manual-assignment path so the picker and validateSubstitute honour the same
+ * "allow unrelated substitutions" switch the generation engine honours.
+ */
+export function isUnrelatedToEntry(entry: TimetableEntryWithRelations, candidate: Faculty): boolean {
+  const teachesSection = facultyRepository.teachesSection(candidate.id, entry.sectionId)
+  const sameDepartment = candidate.departmentId === entry.section?.departmentId
+  const isQualified = facultyRepository.isQualifiedForSubject(candidate.id, entry.subjectId)
+
+  const db = getDatabase()
+  const sameSemester = entry.section
+    ? (db.prepare(`
+        SELECT DISTINCT sec.semester
+        FROM sections sec
+        JOIN faculty_sections fs ON sec.id = fs.section_id
+        WHERE fs.faculty_id = ?
+      `).all(candidate.id) as { semester: number }[]).some(s => s.semester === entry.section!.semester)
+    : false
+  const teachesSubject = db.prepare(`
+    SELECT 1 FROM timetable_entries te
+    WHERE te.faculty_id = ? AND te.subject_id = ? AND te.academic_year_id = ?
+    LIMIT 1
+  `).get(candidate.id, entry.subjectId, entry.academicYearId)
+  const taughtBefore = db.prepare(`
+    SELECT 1 FROM timetable_entries te
+    WHERE te.faculty_id = ? AND te.section_id = ? AND te.academic_year_id = ?
+    LIMIT 1
+  `).get(candidate.id, entry.sectionId, entry.academicYearId)
+
+  return priorityTierFor({
+    teachesSection,
+    sameSemester,
+    sameDepartment,
+    teachesAnySection: facultyRepository.getSections(candidate.id).length > 0,
+    isQualified,
+    taughtBefore: Boolean(taughtBefore),
+    teachesSubject: Boolean(teachesSubject),
+  }) >= 5
+}
+
 /**
  * Calculate substitution score for a faculty member for a specific timetable entry
  * This is the core deterministic scoring function
@@ -42,6 +125,16 @@ export function calculateSubstitutionScore(
 
   if (entry.timeSlot?.isBreak) {
     return { faculty: candidate, score: -Infinity, reasons: [], warnings: ['Cannot substitute during break'], priorityTier: 5 }
+  }
+
+  if (isOutsideWorkingHours(entry.timeSlot?.startTime, entry.timeSlot?.endTime)) {
+    return {
+      faculty: candidate,
+      score: -Infinity,
+      reasons: [],
+      warnings: ['Period is outside the configured working hours'],
+      priorityTier: 5,
+    }
   }
 
   // SCORING FACTORS
@@ -141,15 +234,15 @@ export function calculateSubstitutionScore(
   // who normally teaches the affected class is preferred over a teacher of
   // the same subject from another class/semester.
   const teachesAnySection = facultyRepository.getSections(candidate.id).length > 0
-  const priorityTier: PriorityTier = teachesSection
-    ? 1
-    : sameSemester
-      ? 2
-      : sameDepartment && teachesAnySection
-        ? 3
-        : sameDepartment || isQualified || taughtBefore || teachesSubject
-          ? 4
-          : 5
+  const priorityTier: PriorityTier = priorityTierFor({
+    teachesSection,
+    sameSemester,
+    sameDepartment,
+    teachesAnySection,
+    isQualified,
+    taughtBefore: Boolean(taughtBefore),
+    teachesSubject: Boolean(teachesSubject),
+  })
   reasons.push(`✓ ${PRIORITY_TIER_LABELS[priorityTier]}`)
 
   return { faculty: candidate, score, reasons, warnings, priorityTier }

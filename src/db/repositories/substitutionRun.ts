@@ -48,6 +48,15 @@ export class SubstitutionRunRepository extends BaseRepository<SubstitutionRun> {
     })
   }
 
+  /**
+   * Reopen an approved plan after a manual edit — status and approval
+   * metadata must be cleared together so the UI can never show a stale
+   * APPROVED badge on a plan that has changed since approval.
+   */
+  reopen(id: string): SubstitutionRun | null {
+    return this.update(id, { status: 'GENERATED', approvedAt: null, approvedBy: null })
+  }
+
   publish(id: string): SubstitutionRun | null {
     return this.update(id, { status: 'PUBLISHED' })
   }

@@ -13,14 +13,21 @@ import {
   facultyRepository, 
   attendanceRepository,
   timetableEntryRepository,
+  timeSlotRepository,
+  settingsRepository,
 } from '@/db/repositories'
 import { generateSubstitutionPlan, saveSubstitutionRun } from './engine'
+import { isOutsideWorkingHours, isUnrelatedToEntry } from './scoring'
 import { getDatabase } from '@/db/database'
 import { UncoveredEntry } from './types'
 
 export interface SubstitutionResult {
   runId: string
   date: string
+  /** Run lifecycle status (GENERATED / APPROVED …) — shown in the planner. */
+  status: SubstitutionRun['status']
+  approvedBy: string | null
+  approvedAt: string | null
   assignments: SubstitutionAssignmentWithRelations[]
   uncovered: UncoveredEntry[]
   affectedEntries: any[]
@@ -33,7 +40,12 @@ export interface SubstitutionResult {
 }
 
 /**
- * Generate substitution plan for a specific date
+ * Generate substitution plan for a specific date.
+ *
+ * The plan is saved and then read back through `getSubstitutionRun` so the
+ * caller receives exactly what a later reload would show — one source of
+ * truth for statistics and uncovered rows (QA-024: the Locked stat used to
+ * be hardcoded to 0 right after generation until a manual refresh).
  */
 export function generateSubstitutions(date: string): SubstitutionResult {
   const db = getDatabase()
@@ -44,22 +56,13 @@ export function generateSubstitutions(date: string): SubstitutionResult {
   }
 
   const plan = generateSubstitutionPlan(date, academicYear.id)
-  const runId = saveSubstitutionRun(date, plan.assignments, plan.uncovered)
-  const assignments = substitutionAssignmentRepository.findByRunWithRelations(runId)
-  
-  return {
-    runId,
-    date,
-    assignments,
-    uncovered: plan.uncovered,
-    affectedEntries: plan.affectedEntries,
-    statistics: {
-      totalAffected: plan.affectedEntries.length,
-      covered: plan.assignments.filter(a => a.substituteFacultyId).length,
-      uncovered: plan.uncovered.length,
-      manuallyAssigned: 0,
-    },
+  saveSubstitutionRun(date, plan.assignments, plan.uncovered)
+
+  const result = getSubstitutionRun(date)
+  if (!result) {
+    throw new Error('The substitution plan could not be saved. Please try again.')
   }
+  return result
 }
 
 /**
@@ -176,6 +179,9 @@ export function getSubstitutionRun(date: string): SubstitutionResult | null {
   return {
     runId: run.id,
     date: run.date,
+    status: run.status,
+    approvedBy: run.approvedBy ?? null,
+    approvedAt: run.approvedAt ?? null,
     assignments,
     uncovered,
     affectedEntries,
@@ -209,6 +215,8 @@ export interface SubstituteSlot {
   isBreak: boolean
   /** The entry being filled: covering *this* entry is the goal, not a conflict. */
   entryId?: string
+  /** Full relations for the entry — lets validation honour entry-specific rules (P5 gating). */
+  entry?: import('@/types').TimetableEntryWithRelations
   /** The assignment row being edited, so re-picking the same faculty stays legal. */
   excludeAssignmentId?: string
 }
@@ -234,8 +242,33 @@ export function validateSubstitute(slot: SubstituteSlot, facultyId: string): Sub
   if (!faculty.isActive) return { ok: false, reason: `${faculty.name} is inactive.` }
   if (slot.isBreak) return { ok: false, reason: 'Classes cannot be substituted during the break.' }
 
+  // Hard constraint (e): periods outside the configured working hours can
+  // never receive a substitution — same rule the generation engine applies.
+  const timeSlot = timeSlotRepository.findById(slot.timeSlotId)
+  if (timeSlot && isOutsideWorkingHours(timeSlot.startTime, timeSlot.endTime)) {
+    const hours = settingsRepository.getWorkingHours()
+    return {
+      ok: false,
+      reason: `The period ${timeSlot.name} lies outside working hours (${hours.startTime}–${hours.endTime}) and cannot be substituted.`,
+    }
+  }
+
   if (attendanceRepository.getAbsentFacultyIds(slot.date).includes(facultyId)) {
     return { ok: false, reason: `${faculty.name} is marked absent on ${slot.date}.` }
+  }
+
+  // Hard constraint (j): unrelated (P5) faculty are only allowed when the
+  // configuration permits unrelated substitutions — the manual picker and
+  // override must honour the same switch the generation engine honours.
+  if (
+    slot.entry &&
+    !settingsRepository.getAllowUnrelatedSubstitutions() &&
+    isUnrelatedToEntry(slot.entry, faculty)
+  ) {
+    return {
+      ok: false,
+      reason: `${faculty.name} is not related to this class and unrelated substitutions are disabled (Settings → Substitution Rules).`,
+    }
   }
 
   const teaching = timetableEntryRepository.findByFacultyAndDay(
@@ -308,6 +341,7 @@ function slotForAssignment(assignmentId: string): SubstituteSlot | null {
     timeSlotId: entry.timeSlotId,
     isBreak: Boolean(entry.timeSlot?.isBreak),
     entryId: entry.id,
+    entry,
     excludeAssignmentId: assignmentId,
   }
 }
@@ -336,6 +370,18 @@ export function availableSubstitutesForAssignment(assignmentId: string): Faculty
 }
 
 /**
+ * A manual change to an APPROVED plan reopens it for review: the APPROVED
+ * badge must never outlive the change that invalidated it (stale approval
+ * metadata is cleared too).
+ */
+function reopenApprovedRun(runId: string): void {
+  const run = substitutionRunRepository.findById(runId)
+  if (run && run.status === 'APPROVED') {
+    substitutionRunRepository.reopen(runId)
+  }
+}
+
+/**
  * Update a single substitution assignment
  */
 export function updateSubstitutionAssignment(
@@ -345,6 +391,7 @@ export function updateSubstitutionAssignment(
     status?: 'PENDING' | 'APPROVED' | 'REJECTED' | 'LOCKED'
     isLocked?: boolean
     reasoning?: string
+    score?: number | null
   }
 ): any {
   // A substitute chosen by hand must clear the same hard constraints as the
@@ -354,9 +401,37 @@ export function updateSubstitutionAssignment(
     if (!check.ok) return null
   }
 
-  const updated = substitutionAssignmentRepository.update(assignmentId, updates as any)
+  // QA-025: the old candidate's reasoning/score must never survive a manual
+  // change — an uncovered row showing the removed substitute's positive
+  // reasoning (or a new substitute showing the old one's score) is a lie.
+  const normalized: typeof updates = { ...updates }
+  if ('substituteFacultyId' in updates && updates.reasoning === undefined) {
+    normalized.reasoning = updates.substituteFacultyId
+      ? 'Manually assigned by coordinator (hard constraints verified).'
+      : 'Substitute removed by coordinator — class is uncovered.'
+  }
+  if ('substituteFacultyId' in updates && updates.score === undefined) {
+    normalized.score = null
+  }
+
+  // Keep the dual lock representation in sync: regeneration preserves rows
+  // by `is_locked` and deletes the rest, so status='LOCKED' must never exist
+  // without is_locked=1 (a stale mismatch would silently delete a "locked"
+  // row on the next Generate).
+  if (updates.status === 'LOCKED' && updates.isLocked === undefined) {
+    normalized.isLocked = true
+  } else if (updates.status !== undefined && updates.status !== 'LOCKED' && updates.isLocked === undefined) {
+    normalized.isLocked = false
+  } else if (updates.isLocked !== undefined && updates.status === undefined) {
+    normalized.status = updates.isLocked ? 'LOCKED' : 'PENDING'
+  }
+
+  const previous = substitutionAssignmentRepository.findById(assignmentId)
+  const updated = substitutionAssignmentRepository.update(assignmentId, normalized as any)
   if (!updated) return null
   
+  if (previous) reopenApprovedRun(previous.runId)
+
   const run = substitutionRunRepository.findById(updated.runId)
   if (!run) return null
   
@@ -370,6 +445,8 @@ export function lockAssignment(assignmentId: string): any {
   const locked = substitutionAssignmentRepository.lock(assignmentId)
   if (!locked) return null
   
+  reopenApprovedRun(locked.runId)
+
   const run = substitutionRunRepository.findById(locked.runId)
   if (!run) return null
   
@@ -379,7 +456,9 @@ export function lockAssignment(assignmentId: string): any {
 export function unlockAssignment(assignmentId: string): any {
   const unlocked = substitutionAssignmentRepository.unlock(assignmentId)
   if (!unlocked) return null
-  
+
+  reopenApprovedRun(unlocked.runId)
+
   const run = substitutionRunRepository.findById(unlocked.runId)
   if (!run) return null
   
@@ -514,7 +593,22 @@ export function getAllSubstitutionRuns(): SubstitutionRun[] {
 export function deleteSubstitutionRun(date: string): boolean {
   const run = substitutionRunRepository.findByDate(date)
   if (!run) return false
-  
-  substitutionAssignmentRepository.deleteByRun(run.id)
-  return substitutionRunRepository.delete(run.id)
+
+  // Atomic: never leave an empty run row behind (orphan run with its
+  // assignments already gone) if the second statement fails.
+  const db = getDatabase()
+  db.exec('BEGIN')
+  try {
+    substitutionAssignmentRepository.deleteByRun(run.id)
+    const removed = substitutionRunRepository.delete(run.id)
+    db.exec('COMMIT')
+    return removed
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      // BEGIN never landed — nothing to roll back.
+    }
+    throw error
+  }
 }

@@ -352,8 +352,11 @@ export function saveSubstitutionRun(
     ).run(id, date, 'GENERATED')
     runRow = { id }
   } else {
+    // Regeneration supersedes any previous approval — status AND approval
+    // metadata reset together (a GENERATED run with a leftover approved_by
+    // would misrepresent who signed off on what).
     db.prepare(
-      "UPDATE substitution_runs SET status = ?, generated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+      "UPDATE substitution_runs SET status = ?, approved_at = NULL, approved_by = NULL, generated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
     ).run('GENERATED', runRow.id)
   }
 
