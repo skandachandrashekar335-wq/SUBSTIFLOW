@@ -4,13 +4,18 @@
  * Only imported by the main process (and by scripts run under Node). The
  * renderer build swaps this module out for `nodeDb.browser.ts` via a Vite
  * alias, so `better-sqlite3` and `electron` never reach the browser bundle.
+ *
+ * The migration logic itself lives in `./migrations` (no Electron imports)
+ * so tests and CLI scripts can run the exact same code path.
  */
 import Database from 'better-sqlite3'
 import { app } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs'
-import { schema } from './schema'
 import type { SqlDatabase } from './types'
+
+export { runMigrations, TARGET_SCHEMA_VERSION } from './migrations'
+import { runMigrations } from './migrations'
 
 export function resolveDatabasePath(): string {
   const override = process.env.SUBSTIFLOW_DATA_DIR
@@ -33,52 +38,6 @@ export function openNodeDatabase(dbPath: string): SqlDatabase {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   return db as unknown as SqlDatabase
-}
-
-/** Apply the schema and any pending migrations. */
-export function runMigrations(db: SqlDatabase): void {
-  const hasSchemaVersion = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'`)
-    .get()
-
-  if (!hasSchemaVersion) {
-    // First init is atomic: if schema application fails partway, everything
-    // rolls back so the next launch retries cleanly instead of stamping a
-    // half-created schema as complete.
-    db.exec('BEGIN')
-    try {
-      db.exec(
-        `CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`
-      )
-      db.exec(schema)
-      db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(1)
-      db.exec('COMMIT')
-    } catch (error) {
-      try {
-        db.exec('ROLLBACK')
-      } catch {
-        // BEGIN never landed — nothing to roll back.
-      }
-      throw error
-    }
-    return
-  }
-
-  const current = db.prepare('SELECT MAX(version) as version FROM schema_version').get() as
-    | { version: number | null }
-    | undefined
-  const currentVersion = current?.version ?? 0
-  const targetVersion = 1
-
-  for (let v = currentVersion + 1; v <= targetVersion; v++) {
-    runMigration(db, v)
-    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(v)
-  }
-}
-
-function runMigration(_db: SqlDatabase, version: number): void {
-  // Add forward-only migration steps here when the schema evolves.
-  console.log(`Applying database migration ${version}`)
 }
 
 export function createDatabase(): SqlDatabase {

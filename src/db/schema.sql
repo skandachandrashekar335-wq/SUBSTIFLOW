@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS time_slots (
 );
 
 -- Master Timetable Entries
+-- One row = one ACTIVITY (lecture, lab, library period, …) that may span
+-- several consecutive periods (`span`), be taught by ZERO faculty
+-- (faculty-less activities: library, mentoring, …) or by a TEAM
+-- (timetable_entry_faculty), and may use ZERO or more rooms
+-- (timetable_entry_rooms). Faculty/room conflicts are enforced by the
+-- timetable service (span-aware), not by UNIQUE constraints.
 CREATE TABLE IF NOT EXISTS timetable_entries (
     id TEXT PRIMARY KEY,
     academic_year_id TEXT NOT NULL,
@@ -98,20 +104,60 @@ CREATE TABLE IF NOT EXISTS timetable_entries (
     time_slot_id TEXT NOT NULL,
     section_id TEXT NOT NULL,
     subject_id TEXT NOT NULL,
-    faculty_id TEXT NOT NULL,
-    room_id TEXT NOT NULL,
     class_type TEXT NOT NULL DEFAULT 'LECTURE',
+    span INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE,
     FOREIGN KEY (time_slot_id) REFERENCES time_slots(id) ON DELETE RESTRICT,
     FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
     FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
-    FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE RESTRICT,
-    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE RESTRICT,
-    UNIQUE(academic_year_id, day_of_week, time_slot_id, section_id),
-    UNIQUE(academic_year_id, day_of_week, time_slot_id, faculty_id),
-    UNIQUE(academic_year_id, day_of_week, time_slot_id, room_id)
+    UNIQUE(academic_year_id, day_of_week, time_slot_id, section_id)
+);
+
+-- Faculty members attached to an entry (0..N per entry, ordered team).
+CREATE TABLE IF NOT EXISTS timetable_entry_faculty (
+    entry_id TEXT NOT NULL,
+    faculty_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (entry_id, faculty_id),
+    FOREIGN KEY (entry_id) REFERENCES timetable_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE RESTRICT
+);
+
+-- Rooms attached to an entry (0..N per entry, ordered; position 0 = primary).
+CREATE TABLE IF NOT EXISTS timetable_entry_rooms (
+    entry_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (entry_id, room_id),
+    FOREIGN KEY (entry_id) REFERENCES timetable_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE RESTRICT
+);
+
+-- Terms / timetable validity windows inside an academic year.
+-- Answers "which timetable is effective on <date>?".
+CREATE TABLE IF NOT EXISTS terms (
+    id TEXT PRIMARY KEY,
+    academic_year_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE
+);
+
+-- Audit trail for important coordinator actions (who/what/when).
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Faculty-Subject Qualifications
@@ -202,8 +248,11 @@ CREATE TABLE IF NOT EXISTS application_settings (
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_timetable_entries_academic_year ON timetable_entries(academic_year_id);
 CREATE INDEX IF NOT EXISTS idx_timetable_entries_day_slot ON timetable_entries(day_of_week, time_slot_id);
-CREATE INDEX IF NOT EXISTS idx_timetable_entries_faculty ON timetable_entries(faculty_id);
 CREATE INDEX IF NOT EXISTS idx_timetable_entries_section ON timetable_entries(section_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_entry_faculty_faculty ON timetable_entry_faculty(faculty_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_entry_rooms_room ON timetable_entry_rooms(room_id);
+CREATE INDEX IF NOT EXISTS idx_terms_academic_year ON terms(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
 CREATE INDEX IF NOT EXISTS idx_attendance_faculty ON attendance(faculty_id);
 CREATE INDEX IF NOT EXISTS idx_substitution_runs_date ON substitution_runs(date);
@@ -286,4 +335,10 @@ CREATE TRIGGER IF NOT EXISTS update_application_settings_updated_at
 AFTER UPDATE ON application_settings
 BEGIN
     UPDATE application_settings SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_terms_updated_at
+AFTER UPDATE ON terms
+BEGIN
+    UPDATE terms SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
