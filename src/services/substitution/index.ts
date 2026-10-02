@@ -15,9 +15,13 @@ import {
   timetableEntryRepository,
   timeSlotRepository,
   settingsRepository,
+  auditLogRepository,
+  AUDIT_ACTIONS,
 } from '@/db/repositories'
-import { generateSubstitutionPlan, saveSubstitutionRun } from './engine'
+import { generateSubstitutionPlan, saveSubstitutionRun, findAffectedEntries } from './engine'
+export { findAffectedEntries } from './engine'
 import { isOutsideWorkingHours, isUnrelatedToEntry } from './scoring'
+import { coveredSlotsOf } from '@/services/timetable'
 import { getDatabase } from '@/db/database'
 import { UncoveredEntry } from './types'
 
@@ -62,6 +66,12 @@ export function generateSubstitutions(date: string): SubstitutionResult {
   if (!result) {
     throw new Error('The substitution plan could not be saved. Please try again.')
   }
+  auditLogRepository.record(
+    AUDIT_ACTIONS.SUBSTITUTION_GENERATED,
+    'substitution_run',
+    result.runId,
+    `${date}: ${result.statistics.covered} covered, ${result.statistics.uncovered} uncovered`
+  )
   return result
 }
 
@@ -83,89 +93,11 @@ export function getSubstitutionRun(date: string): SubstitutionResult | null {
     const dayIndex = dateObj.getDay()
     const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
     const dayOfWeek = dayNames[dayIndex]
-    
-    const absentFacultyIds = db.prepare('SELECT faculty_id FROM attendance WHERE date = ? AND status = ?').all(date, 'ABSENT') as { faculty_id: string }[]
-    
-    for (const { faculty_id } of absentFacultyIds) {
-      const entries = db.prepare(`
-        SELECT 
-          te.*,
-          ts.name as time_slot_name, ts.start_time, ts.end_time, ts."order" as slot_order, ts.is_break,
-          sec.name as section_name, sec.semester, sec.department_id as section_department_id,
-          s.name as subject_name, s.code as subject_code,
-          f.name as faculty_name,
-          r.name as room_name
-        FROM timetable_entries te
-        JOIN time_slots ts ON te.time_slot_id = ts.id
-        JOIN sections sec ON te.section_id = sec.id
-        JOIN subjects s ON te.subject_id = s.id
-        JOIN faculty f ON te.faculty_id = f.id
-        JOIN rooms r ON te.room_id = r.id
-        WHERE te.faculty_id = ? AND te.day_of_week = ? AND te.academic_year_id = ?
-      `).all(faculty_id, dayOfWeek, academicYear.id) as any[]
-      
-      for (const row of entries) {
-        if (!row.is_break) {
-          affectedEntries.push({
-            id: row.id,
-            academicYearId: row.academic_year_id,
-            dayOfWeek: row.day_of_week,
-            timeSlotId: row.time_slot_id,
-            sectionId: row.section_id,
-            subjectId: row.subject_id,
-            facultyId: row.faculty_id,
-            roomId: row.room_id,
-            classType: row.class_type,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-            timeSlot: {
-              id: row.time_slot_id,
-              name: row.time_slot_name,
-              startTime: row.start_time,
-              endTime: row.end_time,
-              order: row.slot_order,
-              isBreak: Boolean(row.is_break),
-            },
-            section: {
-              id: row.section_id,
-              name: row.section_name,
-              semester: row.semester,
-              departmentId: row.section_department_id,
-              academicYearId: row.academic_year_id,
-              createdAt: '',
-              updatedAt: '',
-            },
-            subject: {
-              id: row.subject_id,
-              name: row.subject_name,
-              code: row.subject_code,
-              departmentId: '',
-              defaultClassType: row.class_type as any,
-              createdAt: '',
-              updatedAt: '',
-            },
-            faculty: {
-              id: row.faculty_id,
-              name: row.faculty_name,
-              departmentId: '',
-              isActive: true,
-              maxDailySubstitutions: 2,
-              priority: 0,
-              createdAt: '',
-              updatedAt: '',
-            },
-            room: {
-              id: row.room_id,
-              name: row.room_name,
-              capacity: 0,
-              type: 'CLASSROOM',
-              createdAt: '',
-              updatedAt: '',
-            },
-          })
-        }
-      }
-    }
+
+    // Same policy-aware logic the generator used → stats always agree with
+    // the plan (TEAM_SUFFICIENT activities are not counted as affected).
+    const absentFacultyIds = new Set(attendanceRepository.getAbsentFacultyIds(date))
+    affectedEntries = findAffectedEntries(absentFacultyIds, dayOfWeek, academicYear.id)
   }
 
   const uncovered: UncoveredEntry[] = assignments
@@ -201,7 +133,16 @@ export function approveSubstitutionRun(date: string, approvedBy: string): Substi
   const run = substitutionRunRepository.findByDate(date)
   if (!run) return null
   
-  return substitutionRunRepository.approve(run.id, approvedBy)
+  const approved = substitutionRunRepository.approve(run.id, approvedBy)
+  if (approved) {
+    auditLogRepository.record(
+      AUDIT_ACTIONS.SUBSTITUTION_APPROVED,
+      'substitution_run',
+      run.id,
+      `${date} revised timetable approved by ${approvedBy}`
+    )
+  }
+  return approved
 }
 
 /**
@@ -257,6 +198,27 @@ export function validateSubstitute(slot: SubstituteSlot, facultyId: string): Sub
     return { ok: false, reason: `${faculty.name} is marked absent on ${slot.date}.` }
   }
 
+  // SPAN: the substitute must be free for the WHOLE activity — a 2-hour lab
+  // blocks both hours, never just its first period.
+  const orderedSlots = timeSlotRepository.getOrdered()
+  const targetSlots = coveredSlotsOf(
+    { timeSlotId: slot.timeSlotId, span: slot.entry?.span ?? 1 },
+    orderedSlots
+  )
+  const targetIds = new Set(targetSlots.map(s => s.id))
+  const targetStart = targetSlots[0]
+  const targetEnd = targetSlots[targetSlots.length - 1]
+
+  // Hard constraint (e): periods outside the configured working hours can
+  // never receive a substitution — same rule the generation engine applies.
+  if (targetStart && targetEnd && isOutsideWorkingHours(targetStart.startTime, targetEnd.endTime)) {
+    const hours = settingsRepository.getWorkingHours()
+    return {
+      ok: false,
+      reason: `The period ${targetStart.startTime}–${targetEnd.endTime} lies outside working hours (${hours.startTime}–${hours.endTime}) and cannot be substituted.`,
+    }
+  }
+
   // Hard constraint (j): unrelated (P5) faculty are only allowed when the
   // configuration permits unrelated substitutions — the manual picker and
   // override must honour the same switch the generation engine honours.
@@ -276,24 +238,37 @@ export function validateSubstitute(slot: SubstituteSlot, facultyId: string): Sub
     slot.dayOfWeek as DayOfWeek,
     slot.academicYearId,
   )
-  if (teaching.some((entry) => entry.timeSlotId === slot.timeSlotId)) {
-    return { ok: false, reason: `${faculty.name} is already teaching another class during this slot.` }
+  for (const entry of teaching) {
+    const busy = coveredSlotsOf(entry, orderedSlots).some(s => targetIds.has(s.id))
+    if (busy) {
+      return { ok: false, reason: `${faculty.name} is already teaching another class during this slot.` }
+    }
   }
 
   const db = getDatabase()
 
   const covering = db.prepare(`
-    SELECT sa.id, sa.original_entry_id, sec.name AS section_name
+    SELECT sa.id, sa.original_entry_id, sec.name AS section_name, te.time_slot_id, te.span
     FROM substitution_assignments sa
     JOIN substitution_runs sr ON sa.run_id = sr.id
     JOIN timetable_entries te ON sa.original_entry_id = te.id
     JOIN sections sec ON te.section_id = sec.id
     WHERE sr.date = ? AND sa.substitute_faculty_id = ? AND sa.status <> 'REJECTED'
-      AND te.time_slot_id = ?
-  `).all(slot.date, facultyId, slot.timeSlotId) as { id: string; original_entry_id: string; section_name: string }[]
+  `).all(slot.date, facultyId) as {
+    id: string
+    original_entry_id: string
+    section_name: string
+    time_slot_id: string
+    span: number
+  }[]
 
   const other = covering.find(
-    (row) => row.original_entry_id !== slot.entryId && row.id !== slot.excludeAssignmentId,
+    (row) =>
+      row.original_entry_id !== slot.entryId &&
+      row.id !== slot.excludeAssignmentId &&
+      coveredSlotsOf({ timeSlotId: row.time_slot_id, span: row.span }, orderedSlots).some(s =>
+        targetIds.has(s.id)
+      ),
   )
   if (other) {
     return {
@@ -434,6 +409,22 @@ export function updateSubstitutionAssignment(
 
   const run = substitutionRunRepository.findById(updated.runId)
   if (!run) return null
+
+  // Audit only REAL coordinator changes: this service function is never
+  // called by the generator (it writes through the repository directly).
+  if ('substituteFacultyId' in normalized) {
+    const name = normalized.substituteFacultyId
+      ? facultyRepository.findById(normalized.substituteFacultyId)?.name ?? 'a faculty member'
+      : null
+    auditLogRepository.record(
+      AUDIT_ACTIONS.SUBSTITUTION_OVERRIDE,
+      'substitution_assignment',
+      assignmentId,
+      name
+        ? `${run.date}: substitute manually set to ${name}`
+        : `${run.date}: substitute removed (class uncovered)`
+    )
+  }
   
   return substitutionAssignmentRepository.findByRunWithRelations(run.id).find(a => a.id === assignmentId) || null
 }
@@ -449,6 +440,12 @@ export function lockAssignment(assignmentId: string): any {
 
   const run = substitutionRunRepository.findById(locked.runId)
   if (!run) return null
+  auditLogRepository.record(
+    AUDIT_ACTIONS.SUBSTITUTION_LOCKED,
+    'substitution_assignment',
+    assignmentId,
+    `${run.date}: assignment locked`
+  )
   
   return substitutionAssignmentRepository.findByRunWithRelations(run.id).find(a => a.id === assignmentId) || null
 }
@@ -461,12 +458,19 @@ export function unlockAssignment(assignmentId: string): any {
 
   const run = substitutionRunRepository.findById(unlocked.runId)
   if (!run) return null
+  auditLogRepository.record(
+    AUDIT_ACTIONS.SUBSTITUTION_UNLOCKED,
+    'substitution_assignment',
+    assignmentId,
+    `${run.date}: assignment unlocked`
+  )
   
   return substitutionAssignmentRepository.findByRunWithRelations(run.id).find(a => a.id === assignmentId) || null
 }
 
 /**
- * Get revised timetable for a date (master + substitutions)
+ * Get revised timetable for a date (master + substitutions).
+ * The master rows are NEVER modified — this is a read-only overlay.
  */
 export function getRevisedTimetable(date: string): RevisedTimetableEntry[] {
   const db = getDatabase()
@@ -479,23 +483,10 @@ export function getRevisedTimetable(date: string): RevisedTimetableEntry[] {
   const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
   const dayOfWeek = dayNames[dayIndex]
   
-  const masterEntries = db.prepare(`
-    SELECT 
-      te.*,
-      ts.name as time_slot_name, ts.start_time, ts.end_time, ts."order" as slot_order, ts.is_break,
-      sec.name as section_name, sec.semester, sec.department_id as section_department_id,
-      s.name as subject_name, s.code as subject_code,
-      f.name as faculty_name, f.id as faculty_id,
-      r.name as room_name, r.id as room_id
-    FROM timetable_entries te
-    JOIN time_slots ts ON te.time_slot_id = ts.id
-    JOIN sections sec ON te.section_id = sec.id
-    JOIN subjects s ON te.subject_id = s.id
-    JOIN faculty f ON te.faculty_id = f.id
-    JOIN rooms r ON te.room_id = r.id
-    WHERE te.academic_year_id = ? AND te.day_of_week = ?
-    ORDER BY ts."order"
-  `).all(academicYear.id, dayOfWeek) as any[]
+  const masterEntries = timetableEntryRepository.getWithRelationsForDay(
+    academicYear.id,
+    dayOfWeek as DayOfWeek
+  )
 
   const run = substitutionRunRepository.findByDate(date)
   const substitutions = run ? substitutionAssignmentRepository.findByRunWithRelations(run.id) : []
@@ -503,74 +494,18 @@ export function getRevisedTimetable(date: string): RevisedTimetableEntry[] {
 
   const revised: RevisedTimetableEntry[] = []
 
-  for (const row of masterEntries) {
-    const substitution = subMap.get(row.id)
+  for (const entry of masterEntries) {
+    const substitution = subMap.get(entry.id)
     const isSubstituted = !!substitution && !!substitution.substituteFacultyId
     
     let substituteFaculty: Faculty | undefined
-    if (isSubstituted && substitution.substituteFacultyId) {
-      const fac = facultyRepository.findById(substitution.substituteFacultyId)
+    if (isSubstituted && substitution!.substituteFacultyId) {
+      const fac = facultyRepository.findById(substitution!.substituteFacultyId)
       if (fac) substituteFaculty = fac
     }
 
     revised.push({
-      originalEntry: {
-        id: row.id,
-        academicYearId: row.academic_year_id,
-        dayOfWeek: row.day_of_week,
-        timeSlotId: row.time_slot_id,
-        sectionId: row.section_id,
-        subjectId: row.subject_id,
-        facultyId: row.faculty_id,
-        roomId: row.room_id,
-        classType: row.class_type,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        timeSlot: {
-          id: row.time_slot_id,
-          name: row.time_slot_name,
-          startTime: row.start_time,
-          endTime: row.end_time,
-          order: row.slot_order,
-          isBreak: Boolean(row.is_break),
-        },
-        section: {
-          id: row.section_id,
-          name: row.section_name,
-          semester: row.semester,
-          departmentId: row.section_department_id,
-          academicYearId: row.academic_year_id,
-          createdAt: '',
-          updatedAt: '',
-        },
-        subject: {
-          id: row.subject_id,
-          name: row.subject_name,
-          code: row.subject_code,
-          departmentId: '',
-          defaultClassType: row.class_type as any,
-          createdAt: '',
-          updatedAt: '',
-        },
-        faculty: {
-          id: row.faculty_id,
-          name: row.faculty_name,
-          departmentId: '',
-          isActive: true,
-          maxDailySubstitutions: 2,
-          priority: 0,
-          createdAt: '',
-          updatedAt: '',
-        },
-        room: {
-          id: row.room_id,
-          name: row.room_name,
-          capacity: 0,
-          type: 'CLASSROOM',
-          createdAt: '',
-          updatedAt: '',
-        },
-      },
+      originalEntry: entry,
       substitution,
       isSubstituted,
       substituteFaculty,
@@ -611,4 +546,65 @@ export function deleteSubstitutionRun(date: string): boolean {
     }
     throw error
   }
+}
+
+// ---------------------------------------------------------------------------
+// Daily operational lifecycle (derived — never a stale stored flag)
+// ---------------------------------------------------------------------------
+
+export type RunLifecycleStatus =
+  | 'NOT_STARTED'
+  | 'ATTENDANCE_IN_PROGRESS'
+  | 'ATTENDANCE_COMPLETE'
+  | 'GENERATED'
+  | 'REVIEW_REQUIRED'
+  | 'ALL_COVERED'
+  | 'APPROVED'
+  | 'LOCKED'
+
+export const RUN_LIFECYCLE_LABELS: Record<RunLifecycleStatus, string> = {
+  NOT_STARTED: 'Not started',
+  ATTENDANCE_IN_PROGRESS: 'Attendance in progress',
+  ATTENDANCE_COMPLETE: 'Attendance complete',
+  GENERATED: 'Generated',
+  REVIEW_REQUIRED: 'Review required',
+  ALL_COVERED: 'All covered',
+  APPROVED: 'Approved',
+  LOCKED: 'Locked',
+}
+
+/**
+ * Today's operational status, derived from actual facts:
+ *
+ *   NOT STARTED → ATTENDANCE IN PROGRESS → ATTENDANCE COMPLETE
+ *   → GENERATED → REVIEW REQUIRED (any uncovered) / ALL COVERED
+ *   → APPROVED → LOCKED (every assignment locked)
+ *
+ * REVIEW REQUIRED stays visible for as long as even one class is uncovered —
+ * the coordinator can never mistake an incomplete plan for a finished one.
+ */
+export function getRunLifecycle(date: string): RunLifecycleStatus {
+  const run = substitutionRunRepository.findByDate(date)
+  const assignments = run ? substitutionAssignmentRepository.findByRun(run.id) : []
+  const hasPlan =
+    !!run &&
+    (run.status !== 'DRAFT' ||
+      assignments.length > 0)
+
+  if (hasPlan && run) {
+    if (run.status === 'APPROVED' || run.status === 'PUBLISHED') {
+      const allLocked =
+        assignments.length > 0 && assignments.every(a => a.isLocked)
+      return allLocked ? 'LOCKED' : 'APPROVED'
+    }
+    if (assignments.length === 0) return 'GENERATED' // plan saved, nothing to cover
+    const uncovered = assignments.some(a => !a.substituteFacultyId)
+    return uncovered ? 'REVIEW_REQUIRED' : 'ALL_COVERED'
+  }
+
+  const marked = attendanceRepository.findByDate(date).length
+  const total = facultyRepository.findActive().length
+  if (marked === 0) return 'NOT_STARTED'
+  if (marked < total) return 'ATTENDANCE_IN_PROGRESS'
+  return 'ATTENDANCE_COMPLETE'
 }

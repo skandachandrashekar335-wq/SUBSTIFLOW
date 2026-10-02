@@ -1,11 +1,13 @@
 import { 
   TimetableEntryWithRelations, 
   Faculty, 
+  TimeSlot,
   SubstitutionWeights, 
   DEFAULT_SUBSTITUTION_WEIGHTS,
 } from '@/types'
-import { facultyRepository, settingsRepository } from '@/db/repositories'
+import { facultyRepository, settingsRepository, timeSlotRepository } from '@/db/repositories'
 import { getDatabase } from '@/db/database'
+import { coveredSlotsOf } from '@/services/timetable'
 import { SubstitutionCandidate, FacultyAvailability, PriorityTier, PRIORITY_TIER_LABELS } from './types'
 
 function toMinutes(time: string): number {
@@ -71,12 +73,14 @@ export function isUnrelatedToEntry(entry: TimetableEntryWithRelations, candidate
     : false
   const teachesSubject = db.prepare(`
     SELECT 1 FROM timetable_entries te
-    WHERE te.faculty_id = ? AND te.subject_id = ? AND te.academic_year_id = ?
+    JOIN timetable_entry_faculty tef ON tef.entry_id = te.id
+    WHERE tef.faculty_id = ? AND te.subject_id = ? AND te.academic_year_id = ?
     LIMIT 1
   `).get(candidate.id, entry.subjectId, entry.academicYearId)
   const taughtBefore = db.prepare(`
     SELECT 1 FROM timetable_entries te
-    WHERE te.faculty_id = ? AND te.section_id = ? AND te.academic_year_id = ?
+    JOIN timetable_entry_faculty tef ON tef.entry_id = te.id
+    WHERE tef.faculty_id = ? AND te.section_id = ? AND te.academic_year_id = ?
     LIMIT 1
   `).get(candidate.id, entry.sectionId, entry.academicYearId)
 
@@ -104,18 +108,25 @@ export function calculateSubstitutionScore(
     allFaculty: Faculty[]
     absentFacultyIds: Set<string>
     lockedAssignments: Map<string, string>
+    /**
+     * Every period the activity occupies (span-aware: a 2-hour lab covers
+     * both hours — a substitute busy in EITHER hour is unavailable).
+     */
+    coveredSlots: TimeSlot[]
   }
 ): SubstitutionCandidate {
   const reasons: string[] = []
   const warnings: string[] = []
   let score = 0
+  const coveredSlots =
+    context.coveredSlots.length > 0 ? context.coveredSlots : []
 
   // HARD CONSTRAINT CHECKS
   if (context.absentFacultyIds.has(candidate.id)) {
     return { faculty: candidate, score: -Infinity, reasons: [], warnings: ['Faculty is absent'], priorityTier: 5 }
   }
 
-  if (availability.busySlots.has(entry.timeSlotId)) {
+  if (coveredSlots.some(s => availability.busySlots.has(s.id))) {
     return { faculty: candidate, score: -Infinity, reasons: [], warnings: ['Already teaching during this slot'], priorityTier: 5 }
   }
 
@@ -127,7 +138,9 @@ export function calculateSubstitutionScore(
     return { faculty: candidate, score: -Infinity, reasons: [], warnings: ['Cannot substitute during break'], priorityTier: 5 }
   }
 
-  if (isOutsideWorkingHours(entry.timeSlot?.startTime, entry.timeSlot?.endTime)) {
+  const rangeStart = coveredSlots[0]?.startTime ?? entry.timeSlot?.startTime
+  const rangeEnd = coveredSlots[coveredSlots.length - 1]?.endTime ?? entry.timeSlot?.endTime
+  if (isOutsideWorkingHours(rangeStart, rangeEnd)) {
     return {
       faculty: candidate,
       score: -Infinity,
@@ -185,7 +198,8 @@ export function calculateSubstitutionScore(
   const db = getDatabase()
   const teachesSubject = db.prepare(`
     SELECT 1 FROM timetable_entries te
-    WHERE te.faculty_id = ? AND te.subject_id = ? AND te.academic_year_id = ?
+    JOIN timetable_entry_faculty tef ON tef.entry_id = te.id
+    WHERE tef.faculty_id = ? AND te.subject_id = ? AND te.academic_year_id = ?
     LIMIT 1
   `).get(candidate.id, entry.subjectId, entry.academicYearId)
   if (teachesSubject) {
@@ -195,7 +209,11 @@ export function calculateSubstitutionScore(
 
   // 6. Free during slot (+20)
   score += weights.freeDuringSlot
-  reasons.push(`✓ Free at ${entry.timeSlot?.name || entry.timeSlotId}`)
+  reasons.push(
+    coveredSlots.length > 1
+      ? `✓ Free for ${rangeStart}–${rangeEnd}`
+      : `✓ Free at ${entry.timeSlot?.name || entry.timeSlotId}`
+  )
 
   // 7. Low substitution count today (+15 for 0)
   const subCount = availability.substitutionCount
@@ -210,7 +228,8 @@ export function calculateSubstitutionScore(
   // 8. Taught section before (+10)
   const taughtBefore = db.prepare(`
     SELECT 1 FROM timetable_entries te
-    WHERE te.faculty_id = ? AND te.section_id = ? AND te.academic_year_id = ?
+    JOIN timetable_entry_faculty tef ON tef.entry_id = te.id
+    WHERE tef.faculty_id = ? AND te.section_id = ? AND te.academic_year_id = ?
     LIMIT 1
   `).get(candidate.id, entry.sectionId, entry.academicYearId)
   if (taughtBefore && !teachesSection) {
@@ -267,6 +286,9 @@ export function getEligibleCandidates(
 ): SubstitutionCandidate[] {
   const candidates: SubstitutionCandidate[] = []
   const allowUnrelated = settingsRepository.getAllowUnrelatedSubstitutions()
+  // Resolved ONCE per entry: the whole duration a substitute must be free for
+  // (2-hour lab → both hours), not just the entry's start period.
+  const coveredSlots = coveredSlotsOf(entry, timeSlotRepository.getOrdered())
 
   for (const faculty of allFaculty) {
     if (!faculty.isActive) continue
@@ -278,6 +300,7 @@ export function getEligibleCandidates(
       allFaculty,
       absentFacultyIds: context.absentFacultyIds,
       lockedAssignments: context.lockedAssignments,
+      coveredSlots,
     })
 
     if (candidate.score === -Infinity) continue

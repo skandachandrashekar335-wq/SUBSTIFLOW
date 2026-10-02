@@ -5,8 +5,9 @@ import {
   SubstitutionWeights, 
   DEFAULT_SUBSTITUTION_WEIGHTS,
 } from '@/types'
-import { facultyRepository, attendanceRepository, substitutionAssignmentRepository, settingsRepository, timetableEntryRepository } from '@/db/repositories'
+import { facultyRepository, attendanceRepository, substitutionAssignmentRepository, settingsRepository, timetableEntryRepository, timeSlotRepository } from '@/db/repositories'
 import { getEligibleCandidates } from './scoring'
+import { coveredSlotsOf } from '@/services/timetable'
 import { getDatabase } from '@/db/database'
 import { SubstitutionProblem, SubstitutionAssignmentResult, UncoveredEntry, FacultyAvailability, SubstitutionCandidate } from './types'
 
@@ -40,24 +41,29 @@ export function buildFacultyAvailability(
       continue
     }
 
-    // Get master timetable entries for this faculty on this day
+    // Get master timetable entries for this faculty on this day.
+    // SPAN-AWARE: a 2-hour lab occupies BOTH periods — the faculty member is
+    // busy (and a substitute must be free) for the whole activity.
     const teachingEntries = timetableEntryRepository.findByFacultyAndDay(faculty.id, dayOfWeek as any, academicYearId)
     const busySlots = new Set<string>()
     for (const entry of teachingEntries) {
-      busySlots.add(entry.timeSlotId)
+      for (const slot of coveredSlotsOf(entry, timeSlots)) busySlots.add(slot.id)
     }
 
-    // Get existing approved substitutions for this date
+    // Get existing approved substitutions for this date (span-expanded too —
+    // an already-arranged 2-hour cover also blocks the substitute's second hour).
     const existingSubs = db.prepare(`
-      SELECT sa.*, te.time_slot_id
+      SELECT sa.*, te.time_slot_id, te.span
       FROM substitution_assignments sa
       JOIN substitution_runs sr ON sa.run_id = sr.id
       JOIN timetable_entries te ON sa.original_entry_id = te.id
       WHERE sr.date = ? AND sa.substitute_faculty_id = ? AND sa.status IN ('APPROVED', 'LOCKED')
-    `).all(date, faculty.id) as { time_slot_id: string }[]
+    `).all(date, faculty.id) as { time_slot_id: string; span: number }[]
 
     for (const sub of existingSubs) {
-      busySlots.add(sub.time_slot_id)
+      for (const slot of coveredSlotsOf({ timeSlotId: sub.time_slot_id, span: sub.span }, timeSlots)) {
+        busySlots.add(slot.id)
+      }
     }
 
     const substitutionCount = facultyRepository.getDailySubstitutionCount(faculty.id, date)
@@ -124,6 +130,14 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
   const uncovered: UncoveredEntry[] = []
   const usedFacultySlots = new Map<string, Set<string>>()
   const facultySubCounts = new Map<string, number>()
+  const absentSet = new Set(absentFacultyIds)
+
+  // SPAN: every period each affected activity occupies. A substitute must be
+  // free for ALL of them and, once assigned, is reserved for ALL of them —
+  // no partial double-booking of a 2-hour lab's second hour.
+  const coveredByEntry = new Map<string, TimeSlot[]>(
+    affectedEntries.map(e => [e.id, coveredSlotsOf(e, timeSlots)])
+  )
 
   for (const [facultyId, avail] of facultyAvailability) {
     usedFacultySlots.set(facultyId, new Set(avail.busySlots))
@@ -133,12 +147,12 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
   // Try to assign each entry
   for (const { entry, candidateList } of entriesWithCandidates) {
     let assigned = false
+    const covered = coveredByEntry.get(entry.id) ?? []
 
     for (const candidate of candidateList) {
       const facultyId = candidate.faculty.id
-      const timeSlotId = entry.timeSlotId
 
-      if (usedFacultySlots.get(facultyId)?.has(timeSlotId)) continue
+      if (covered.some(s => usedFacultySlots.get(facultyId)?.has(s.id))) continue
       const currentCount = facultySubCounts.get(facultyId) || 0
       if (currentCount >= maxDailySubstitutions) continue
 
@@ -155,6 +169,17 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
           `; Class familiarity (P${candidate.priorityTier}) prioritized over ${qualifiedOutranked.length}` +
           ' subject-qualified candidate(s) teaching other classes, per configured rules'
       }
+      // Multi-faculty activity under REPLACE_ABSENT: say exactly who is being
+      // covered and that the rest of the team remains.
+      if (entry.facultyIds.length > 1) {
+        const absentHere = entry.facultyIds.filter(f => absentSet.has(f))
+        if (absentHere.length > 0 && absentHere.length < entry.facultyIds.length) {
+          const names = absentHere
+            .map(id => facultyRepository.findById(id)?.name ?? 'A faculty member')
+            .join(', ')
+          reasoning = `Covering for absent faculty: ${names} (rest of the team continues); ${reasoning}`
+        }
+      }
 
       assignments.push({
         originalEntryId: entry.id,
@@ -164,7 +189,8 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
         status: 'PENDING',
       })
 
-      usedFacultySlots.get(facultyId)!.add(timeSlotId)
+      // Reserve the substitute for the WHOLE activity duration.
+      for (const s of covered) usedFacultySlots.get(facultyId)!.add(s.id)
       facultySubCounts.set(facultyId, currentCount + 1)
       assigned = true
       break
@@ -201,6 +227,56 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
 /**
  * Main entry point: Generate substitution plan for a date
  */
+/**
+ * Activities affected on `date` under the configured multi-faculty absence
+ * policy. Shared by plan generation AND run statistics so both always agree:
+ *
+ *  - ALL faculty of an activity absent → always affected.
+ *  - SOME absent + TEAM_SUFFICIENT (default) → the remaining team runs it;
+ *    not affected (no substitution generated).
+ *  - SOME absent + REPLACE_ABSENT → affected; one substitute covers the
+ *    absent member(s) while the rest of the team continues.
+ *  - Faculty-less activities (library, mentoring, …) are never affected —
+ *    there is no one to substitute.
+ */
+export function findAffectedEntries(
+  absentFacultyIds: Set<string>,
+  dayOfWeek: string,
+  academicYearId: string
+): TimetableEntryWithRelations[] {
+  if (absentFacultyIds.size === 0) return []
+
+  // Every activity an absent faculty member is part of (deduplicated — a
+  // multi-faculty lab is found via each of its absent members once).
+  const candidateEntryIds = new Set<string>()
+  for (const facultyId of absentFacultyIds) {
+    const entries = timetableEntryRepository.findByFacultyAndDay(
+      facultyId,
+      dayOfWeek as any,
+      academicYearId
+    )
+    for (const entry of entries) candidateEntryIds.add(entry.id)
+  }
+  if (candidateEntryIds.size === 0) return []
+
+  const policy = settingsRepository.getMultiFacultyAbsencePolicy()
+  const withRelations = timetableEntryRepository.getWithRelationsByIds([...candidateEntryIds])
+  const affectedEntries: TimetableEntryWithRelations[] = []
+
+  for (const entry of withRelations) {
+    if (entry.timeSlot?.isBreak) continue
+    const team = entry.facultyIds
+    if (team.length === 0) continue
+    const absentHere = team.filter(f => absentFacultyIds.has(f))
+    if (absentHere.length === 0) continue
+    const allAbsent = absentHere.length === team.length
+    if (!allAbsent && policy === 'TEAM_SUFFICIENT') continue // team continues
+    affectedEntries.push(entry)
+  }
+
+  return affectedEntries
+}
+
 export function generateSubstitutionPlan(date: string, academicYearId: string): {
   assignments: SubstitutionAssignmentResult[]
   uncovered: UncoveredEntry[]
@@ -219,98 +295,14 @@ export function generateSubstitutionPlan(date: string, academicYearId: string): 
   const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
   const dayOfWeek = dayNames[dayIndex]
 
-  // Get affected timetable entries
-  const affectedEntries: TimetableEntryWithRelations[] = []
-  const db = getDatabase()
-  
-  for (const facultyId of absentFacultyIds) {
-    const entries = timetableEntryRepository.findByFacultyAndDay(facultyId, dayOfWeek as any, academicYearId)
-    for (const entry of entries) {
-      const withRelations = db.prepare(`
-        SELECT 
-          te.*,
-          ts.name as time_slot_name, ts.start_time, ts.end_time, ts."order" as slot_order, ts.is_break,
-          sec.name as section_name, sec.semester, sec.department_id as section_department_id,
-          s.name as subject_name, s.code as subject_code,
-          f.name as faculty_name,
-          r.name as room_name
-        FROM timetable_entries te
-        JOIN time_slots ts ON te.time_slot_id = ts.id
-        JOIN sections sec ON te.section_id = sec.id
-        JOIN subjects s ON te.subject_id = s.id
-        JOIN faculty f ON te.faculty_id = f.id
-        JOIN rooms r ON te.room_id = r.id
-        WHERE te.id = ?
-      `).get(entry.id) as any
-      
-      if (withRelations && !withRelations.is_break) {
-        affectedEntries.push({
-          id: withRelations.id,
-          academicYearId: withRelations.academic_year_id,
-          dayOfWeek: withRelations.day_of_week,
-          timeSlotId: withRelations.time_slot_id,
-          sectionId: withRelations.section_id,
-          subjectId: withRelations.subject_id,
-          facultyId: withRelations.faculty_id,
-          roomId: withRelations.room_id,
-          classType: withRelations.class_type,
-          createdAt: withRelations.created_at,
-          updatedAt: withRelations.updated_at,
-          timeSlot: {
-            id: withRelations.time_slot_id,
-            name: withRelations.time_slot_name,
-            startTime: withRelations.start_time,
-            endTime: withRelations.end_time,
-            order: withRelations.slot_order,
-            isBreak: Boolean(withRelations.is_break),
-          },
-          section: {
-            id: withRelations.section_id,
-            name: withRelations.section_name,
-            semester: withRelations.semester,
-            departmentId: withRelations.section_department_id,
-            academicYearId: withRelations.academic_year_id,
-            createdAt: '',
-            updatedAt: '',
-          },
-          subject: {
-            id: withRelations.subject_id,
-            name: withRelations.subject_name,
-            code: withRelations.subject_code,
-            departmentId: '',
-            defaultClassType: withRelations.class_type as any,
-            createdAt: '',
-            updatedAt: '',
-          },
-          faculty: {
-            id: withRelations.faculty_id,
-            name: withRelations.faculty_name,
-            departmentId: '',
-            isActive: true,
-            maxDailySubstitutions: 2,
-            priority: 0,
-            createdAt: '',
-            updatedAt: '',
-          },
-          room: {
-            id: withRelations.room_id,
-            name: withRelations.room_name,
-            capacity: 0,
-            type: 'CLASSROOM',
-            createdAt: '',
-            updatedAt: '',
-          },
-        })
-      }
-    }
-  }
+  const affectedEntries = findAffectedEntries(absentFacultyIds, dayOfWeek, academicYearId)
 
   if (affectedEntries.length === 0) {
     return { assignments: [], uncovered: [], affectedEntries: [] }
   }
 
   const allFaculty = facultyRepository.findActive()
-  const timeSlots = db.prepare('SELECT * FROM time_slots ORDER BY "order"').all() as TimeSlot[]
+  const timeSlots = timeSlotRepository.getOrdered()
   const weights = settingsRepository.getSubstitutionWeights() as unknown as SubstitutionWeights
   const maxDailySubstitutions = settingsRepository.getMaxDailySubstitutions()
 
