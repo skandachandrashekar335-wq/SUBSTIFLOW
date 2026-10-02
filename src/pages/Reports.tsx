@@ -10,6 +10,7 @@ import { Select, SelectOption } from '@/components/ui/Select'
 import { Input } from '@/components/ui/Input'
 import { useAppStore } from '@/stores/appStore'
 import { facultyRepository, substitutionRunRepository, substitutionAssignmentRepository, timetableEntryRepository, attendanceRepository, timeSlotRepository, settingsRepository } from '@/db/repositories'
+import { findAffectedEntries } from '@/services/substitution/engine'
 
 type ReportType = 'daily' | 'monthly' | 'faculty-stats' | 'uncovered'
 
@@ -48,16 +49,10 @@ export function Reports() {
     const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
     const dayOfWeek = dayNames[dayIndex]
 
-    let affected = 0
-    // Break periods are not classes — count only real teaching slots so this
-    // agrees with the Dashboard and with what the engine actually solves.
-    const breakSlotIds = new Set(timeSlotRepository.getBreakSlots().map(s => s.id))
-    for (const facultyId of absentIds) {
-      const entries = timetableEntryRepository
-        .findByFacultyAndDay(facultyId, dayOfWeek as any, currentAcademicYear.id)
-        .filter(e => !breakSlotIds.has(e.timeSlotId))
-      affected += entries.length
-    }
+    // Same policy-aware, span-aware, deduplicated calculation the generator
+    // uses — so "Affected" here always matches the plan the engine produces.
+    const affectedEntries = findAffectedEntries(absentIds, dayOfWeek as any, currentAcademicYear.id)
+    const affected = affectedEntries.length
 
     const covered = assignments.filter(a => a.substituteFacultyId).length
 
@@ -110,7 +105,7 @@ export function Reports() {
       for (const run of allRuns) {
         const assignments = substitutionAssignmentRepository.findByRunWithRelations(run.id)
         totalSubs += assignments.filter(a => a.substituteFacultyId === f.id).length
-        asOriginal += assignments.filter(a => a.originalEntry?.facultyId === f.id).length
+        asOriginal += assignments.filter(a => a.originalEntry?.facultyIds.includes(f.id) ?? false).length
       }
       return { faculty: f, totalSubs, asOriginal }
     }).sort((a, b) => b.totalSubs - a.totalSubs)
@@ -132,7 +127,7 @@ export function Reports() {
             section: u.originalEntry.section?.name || '',
             subject: u.originalEntry.subject?.name || '',
             slot: u.originalEntry.timeSlot?.name || '',
-            faculty: u.originalEntry.faculty?.name || '',
+            faculty: (u.originalEntry.facultyList ?? []).map(f => f.name).join(', ') || u.originalEntry.faculty?.name || '',
           })
         }
       }
@@ -148,11 +143,12 @@ export function Reports() {
     if (reportType === 'daily' && dailyData) {
       const rows = dailyData.assignments.map(a => {
         const e = a.originalEntry
+        const team = (e?.facultyList ?? []).map(f => f.name).join(', ') || e?.faculty?.name || ''
         return [
           e?.section?.name || '',
           e?.subject?.name || '',
           e?.timeSlot?.name || '',
-          e?.faculty?.name || '',
+          team,
           a.substituteFaculty?.name || 'Uncovered',
           a.substituteFacultyId ? (a.isLocked ? 'Locked' : 'Substituted') : 'Uncovered',
         ]
@@ -380,7 +376,10 @@ export function Reports() {
                       <TableCell className="font-medium">{a.originalEntry?.section?.name}</TableCell>
                       <TableCell>{a.originalEntry?.subject?.name}</TableCell>
                       <TableCell>{a.originalEntry?.timeSlot?.name}</TableCell>
-                      <TableCell className="text-secondary-500">{a.originalEntry?.faculty?.name}</TableCell>
+                      <TableCell className="text-secondary-500">
+                        {(a.originalEntry?.facultyList ?? []).map(f => f.name).join(', ') ||
+                          a.originalEntry?.faculty?.name}
+                      </TableCell>
                       <TableCell className={a.substituteFacultyId ? 'text-primary-700 font-medium' : 'text-danger-600'}>
                         {a.substituteFaculty?.name || 'Uncovered'}
                       </TableCell>

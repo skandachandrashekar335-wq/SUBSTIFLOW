@@ -97,7 +97,7 @@ export function Rooms() {
 
   const getUsage = (roomId: string) => {
     if (!currentAcademicYear) return 0
-    return timetableEntryRepository.findWhere({ academic_year_id: currentAcademicYear.id, room_id: roomId }).length
+    return timetableEntryRepository.countByRoom(roomId, currentAcademicYear.id)
   }
 
   const typeOptions: SelectOption[] = [

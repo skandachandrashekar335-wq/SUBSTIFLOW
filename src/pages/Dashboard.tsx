@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { 
   Users, CheckCircle, AlertCircle, Calendar, Clock, 
-  ArrowRight, Plus, BookOpen, Building2, FileText
+  ArrowRight, Plus, BookOpen, Building2, FileText, Activity
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { Button } from '@/components/ui/Button'
@@ -15,10 +15,37 @@ import {
   substitutionRunRepository,
   substitutionAssignmentRepository,
   timetableEntryRepository,
-  timeSlotRepository,
-  sectionRepository 
+  sectionRepository,
+  termRepository,
+  auditLogRepository,
 } from '@/db/repositories'
+import {
+  findAffectedEntries,
+  getRunLifecycle,
+  RUN_LIFECYCLE_LABELS,
+} from '@/services/substitution'
+import type { RunLifecycleStatus } from '@/services/substitution'
 import { cn } from '@/utils/cn'
+
+/** Human labels for the audit trail's canonical action names. */
+const AUDIT_LABELS: Record<string, string> = {
+  'timetable.created': 'Timetable entry added',
+  'timetable.updated': 'Timetable entry edited',
+  'timetable.deleted': 'Timetable entry deleted',
+  'attendance.marked': 'Attendance marked',
+  'substitution.generated': 'Substitutions generated',
+  'substitution.override': 'Substitute overridden',
+  'substitution.locked': 'Assignment locked',
+  'substitution.unlocked': 'Assignment unlocked',
+  'substitution.approved': 'Revised timetable approved',
+}
+
+interface BannerSpec {
+  tone: 'info' | 'warning' | 'danger' | 'success'
+  title: string
+  text: string
+  cta: { to: string; label: string }
+}
 
 export function Dashboard() {
   const { currentAcademicYear, currentDate, setCurrentDate } = useAppStore()
@@ -36,30 +63,39 @@ export function Dashboard() {
     const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
     const dayOfWeek = dayNames[dayIndex]
 
-    let affectedEntries = 0
-    // Skip break periods — they are not classes (is_break is the source of
-    // truth, not a hardcoded slot id like 'break').
-    const breakSlotIds = new Set(timeSlotRepository.getBreakSlots().map(s => s.id))
-    for (const facultyId of absentFacultyIds) {
-      const entries = timetableEntryRepository.findByFacultyAndDay(facultyId, dayOfWeek as any, currentAcademicYear.id)
-      affectedEntries += entries.filter(e => !breakSlotIds.has(e.timeSlotId)).length
-    }
+    // Policy-aware: TEAM_SUFFICIENT activities where part of the team is
+    // present are NOT affected (the remaining team runs them) — the same
+    // logic the generator uses, so the dashboard never overcounts.
+    const affectedEntries = findAffectedEntries(absentFacultyIds, dayOfWeek, currentAcademicYear.id).length
 
     const run = substitutionRunRepository.findByDate(today)
     const assignments = run ? substitutionAssignmentRepository.findByRun(run.id) : []
     const covered = assignments.filter(a => a.substituteFacultyId).length
-    const uncovered = affectedEntries - covered
+    const uncovered = assignments.filter(a => !a.substituteFacultyId).length
 
     return {
       totalFaculty: allFaculty.length,
       presentCount,
       absentCount: absentFacultyIds.size,
+      markedCount: attendanceRepository.findByDate(today).length,
       affectedEntries,
       covered,
       uncovered,
       substitutionCount: covered,
+      hasRun: Boolean(run),
     }
   }, [currentAcademicYear, today])
+
+  const lifecycle = useMemo<RunLifecycleStatus>(() => getRunLifecycle(today), [today])
+
+  const effectiveTerm = useMemo(() => {
+    const active = termRepository.getActive()
+    if (!active) return null
+    const todayInRange = today >= active.startDate && today <= active.endDate
+    return { term: active, todayInRange }
+  }, [today])
+
+  const recentActivity = useMemo(() => auditLogRepository.findRecent(8), [lifecycle, today])
 
   const recentRuns = useMemo(() => {
     return substitutionRunRepository.findAll().slice(0, 5)
@@ -78,12 +114,96 @@ export function Dashboard() {
 
   const dayName = new Date(today + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
 
+  // The morning workflow, derived from actual state — the banner always
+  // shows the ONE next step: attendance → generate → review → approve →
+  // revised timetable.
+  const banner: BannerSpec | null = (() => {
+    switch (lifecycle) {
+      case 'NOT_STARTED':
+        return {
+          tone: 'info',
+          title: 'Start today’s workflow',
+          text: 'Mark faculty attendance first — substitutions are only generated from real attendance.',
+          cta: { to: '/attendance', label: 'Mark Attendance' },
+        }
+      case 'ATTENDANCE_IN_PROGRESS':
+        return {
+          tone: 'warning',
+          title: `Attendance in progress — ${stats?.markedCount ?? 0} of ${stats?.totalFaculty ?? 0} marked`,
+          text: 'Finish marking attendance so today’s substitutions can be generated.',
+          cta: { to: '/attendance', label: 'Continue Attendance' },
+        }
+      case 'ATTENDANCE_COMPLETE':
+        return {
+          tone: 'info',
+          title: 'Attendance complete',
+          text: stats?.absentCount
+            ? `${stats.absentCount} faculty absent — generate substitutions to cover ${stats.affectedEntries} affected class(es).`
+            : 'All faculty present — generate substitutions to confirm nothing needs covering.',
+          cta: { to: '/substitution', label: 'Generate Substitutions' },
+        }
+      case 'GENERATED':
+        return {
+          tone: 'info',
+          title: 'Substitution plan generated',
+          text: 'Review the plan and approve the revised timetable for today.',
+          cta: { to: '/substitution', label: 'Review Plan' },
+        }
+      case 'REVIEW_REQUIRED':
+        return {
+          tone: 'danger',
+          title: `${stats?.uncovered ?? 0} class${(stats?.uncovered ?? 0) === 1 ? '' : 'es'} still uncovered`,
+          text: 'A plan with uncovered classes is never “done” — review, assign substitutes manually where possible, then approve.',
+          cta: { to: '/substitution', label: 'Review Uncovered' },
+        }
+      case 'ALL_COVERED':
+        return {
+          tone: 'success',
+          title: 'All affected classes covered',
+          text: 'Review the assignments and approve today’s revised timetable.',
+          cta: { to: '/substitution', label: 'Review & Approve' },
+        }
+      case 'APPROVED':
+        return {
+          tone: 'success',
+          title: 'Revised timetable approved',
+          text: 'The revised timetable for today is ready to print or export.',
+          cta: { to: '/revised', label: 'View Revised Timetable' },
+        }
+      case 'LOCKED':
+        return {
+          tone: 'success',
+          title: 'Assignments locked',
+          text: 'Today’s revised timetable is final — print or export it for circulation.',
+          cta: { to: '/revised', label: 'View Revised Timetable' },
+        }
+      default:
+        return null
+    }
+  })()
+
+  const bannerTones = {
+    info: 'bg-primary-50 border-primary-200 text-primary-900',
+    warning: 'bg-warning-50 border-warning-200 text-warning-900',
+    danger: 'bg-danger-50 border-danger-200 text-danger-900',
+    success: 'bg-success-50 border-success-200 text-success-900',
+  }
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-secondary-900">Dashboard</h1>
+          <h1 className="text-2xl font-bold text-secondary-900">Hi, Admin</h1>
           <p className="text-secondary-500">{dayName}</p>
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <Badge variant="neutral" data-testid="lifecycle-status">{RUN_LIFECYCLE_LABELS[lifecycle]}</Badge>
+            {effectiveTerm && (
+              <Badge variant={effectiveTerm.todayInRange ? 'info' : 'warning'}>
+                {effectiveTerm.todayInRange ? 'Effective' : 'Outside term'}: {effectiveTerm.term.name}
+              </Badge>
+            )}
+            <Badge variant="neutral">{currentAcademicYear.name}</Badge>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <label className="text-sm text-secondary-600">Date:</label>
@@ -96,20 +216,38 @@ export function Dashboard() {
         </div>
       </div>
 
+      {banner && (
+        <div
+          data-testid="workflow-banner"
+          className={cn('flex flex-col sm:flex-row sm:items-center gap-4 p-4 rounded-lg border', bannerTones[banner.tone])}
+        >
+          <div className="flex-1 min-w-0">
+            <p className="font-semibold">{banner.title}</p>
+            <p className="text-sm opacity-90 mt-0.5">{banner.text}</p>
+          </div>
+          <Link to={banner.cta.to} className="shrink-0">
+            <Button size="sm">
+              {banner.cta.label}
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+          </Link>
+        </div>
+      )}
+
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <StatCard title="Total Faculty" value={stats?.totalFaculty || 0} icon={Users} color="primary" />
         <StatCard title="Present Today" value={stats?.presentCount || 0} icon={CheckCircle} color="success" />
         <StatCard title="Absent Today" value={stats?.absentCount || 0} icon={AlertCircle} color="danger" />
-        <StatCard title="Affected Classes" value={stats?.affectedEntries || 0} icon={Calendar} color="warning" />
+        <StatCard title="Affected Classes" value={stats?.affectedEntries || 0} icon={Calendar} color="warning" subtitle="per multi-faculty policy" />
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
-        <StatCard title="Classes Covered" value={stats?.covered || 0} icon={CheckCircle} color="success" subtitle={`${stats?.uncovered || 0} uncovered`} />
-        <StatCard title="Uncovered Classes" value={stats?.uncovered || 0} icon={AlertCircle} color="danger" />
+        <StatCard title="Classes Covered" value={stats?.covered || 0} icon={CheckCircle} color="success" subtitle={stats?.hasRun ? `${stats?.uncovered || 0} uncovered` : 'not generated yet'} />
+        <StatCard title="Uncovered Classes" value={stats?.uncovered || 0} icon={AlertCircle} color="danger" subtitle={stats?.hasRun ? 'needs review' : 'not generated yet'} />
         <StatCard title="Substitutions Made" value={stats?.substitutionCount || 0} icon={Clock} color="info" />
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Link to="/attendance">
           <Card className="hover:shadow-md transition-shadow cursor-pointer h-full">
             <CardBody className="flex items-start gap-4">
@@ -143,9 +281,20 @@ export function Dashboard() {
             </CardBody>
           </Card>
         </Link>
+        <Link to="/revised">
+          <Card className="hover:shadow-md transition-shadow cursor-pointer h-full">
+            <CardBody className="flex items-start gap-4">
+              <div className="p-3 rounded-xl bg-secondary-100 text-secondary-700"><FileText className="h-6 w-6" /></div>
+              <div className="flex-1">
+                <h3 className="font-semibold text-secondary-900">Revised Timetable</h3>
+                <p className="text-sm text-secondary-500 mt-1">Today's effective schedule — print or export</p>
+              </div>
+            </CardBody>
+          </Card>
+        </Link>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-3">
         <Card>
           <CardHeader>
             <h3 className="text-lg font-semibold text-secondary-900">Recent Substitution Runs</h3>
@@ -192,6 +341,42 @@ export function Dashboard() {
                 <dd className="font-medium text-secondary-900">{facultyRepository.findActive().length}</dd>
               </div>
             </dl>
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <h3 className="text-lg font-semibold text-secondary-900 flex items-center gap-2">
+              <Activity className="h-4 w-4 text-primary-600" />
+              Recent Activity
+            </h3>
+          </CardHeader>
+          <CardBody className="p-0">
+            {recentActivity.length === 0 ? (
+              <div className="p-6 text-center text-secondary-500">No activity recorded yet</div>
+            ) : (
+              <div className="divide-y divide-secondary-200">
+                {recentActivity.map((a) => (
+                  <div key={a.id} className="px-4 py-3" title={a.detail}>
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm font-medium text-secondary-900 truncate">
+                        {AUDIT_LABELS[a.action] ?? a.action}
+                      </p>
+                      <span className="text-xs text-secondary-400 shrink-0">
+                        {(() => {
+                          try {
+                            return format(new Date(a.createdAt), 'MMM d, HH:mm')
+                          } catch {
+                            return a.createdAt
+                          }
+                        })()}
+                      </span>
+                    </div>
+                    {a.detail && <p className="text-xs text-secondary-500 truncate">{a.detail}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
           </CardBody>
         </Card>
       </div>

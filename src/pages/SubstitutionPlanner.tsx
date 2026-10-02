@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { format } from 'date-fns'
 import { 
   Calendar, RefreshCw, CheckCircle, XCircle, AlertTriangle, 
-  Lock, Unlock, Edit, Trash2, Download, Eye, Plus, Table2
+  Lock, Unlock, Edit, Trash2, Download, Eye, Plus, Table2, ArrowRight, Users
 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Card, CardHeader, CardBody } from '@/components/ui/Card'
@@ -21,7 +21,15 @@ import {
   availableSubstitutesForAssignment,
   validateSubstituteAssignment,
   getRevisedTimetable,
+  getRunLifecycle,
+  RUN_LIFECYCLE_LABELS,
 } from '@/services/substitution'
+import { timeRangeLabel } from '@/services/timetable'
+import {
+  attendanceRepository,
+  settingsRepository,
+  timetableEntryRepository,
+} from '@/db/repositories'
 import { cn } from '@/utils/cn'
 
 export function SubstitutionPlanner() {
@@ -177,6 +185,41 @@ export function SubstitutionPlanner() {
     [today, currentAcademicYear, runData]
   )
 
+  // Derived lifecycle (attendance → generate → review → approve → locked) and
+  // today's absent team members — used for honest status + team displays.
+  const lifecycle = useMemo(() => getRunLifecycle(today), [today, runData])
+  const absentIds = useMemo(
+    () => new Set(attendanceRepository.getAbsentFacultyIds(today)),
+    [today, runData]
+  )
+  const multiFacultyPolicy = useMemo(
+    () => settingsRepository.getMultiFacultyAbsencePolicy(),
+    [runData]
+  )
+  // Activities where SOME of the teaching team is absent: under the default
+  // TEAM_SUFFICIENT policy the remaining team keeps running them — visible
+  // here so a partially-absent class is never silently dropped.
+  const teamContinues = useMemo(() => {
+    if (!currentAcademicYear || absentIds.size === 0) return []
+    const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
+    const dayOfWeek = dayNames[new Date(today + 'T00:00:00').getDay()]
+    const ids = new Set<string>()
+    for (const fid of absentIds) {
+      for (const e of timetableEntryRepository.findByFacultyAndDay(fid, dayOfWeek as any, currentAcademicYear.id)) {
+        ids.add(e.id)
+      }
+    }
+    if (ids.size === 0) return []
+    return timetableEntryRepository.getWithRelationsByIds([...ids]).filter(e => {
+      const absentHere = e.facultyIds.filter(f => absentIds.has(f)).length
+      return absentHere > 0 && absentHere < e.facultyIds.length
+    })
+  }, [today, currentAcademicYear, absentIds])
+
+  /** `09:00–11:00` for multi-period activities, the slot label otherwise. */
+  const periodLabel = (entry: any) =>
+    entry ? (entry.span > 1 ? timeRangeLabel(entry.timeSlotId, entry.span) : entry.timeSlot?.name) : ''
+
   const dayName = new Date(today + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
 
   if (!currentAcademicYear) {
@@ -201,6 +244,9 @@ export function SubstitutionPlanner() {
                 {isApproved ? 'APPROVED' : runData.status}
               </Badge>
             )}
+            <Badge variant="neutral" data-testid="lifecycle-status">
+              {RUN_LIFECYCLE_LABELS[lifecycle]}
+            </Badge>
           </div>
           <p className="text-secondary-500">
             Generate and review substitutions for {dayName}
@@ -250,6 +296,41 @@ export function SubstitutionPlanner() {
         </Card>
       )}
 
+      {teamContinues.length > 0 && multiFacultyPolicy === 'TEAM_SUFFICIENT' && (
+        <Card className="border-info-200 bg-primary-50/40">
+          <CardHeader>
+            <h3 className="text-lg font-semibold text-secondary-900 flex items-center gap-2">
+              <Users className="h-5 w-5 text-primary-600" />
+              Running With Remaining Team ({teamContinues.length})
+            </h3>
+            <p className="text-sm text-secondary-500">
+              Policy <strong>TEAM_SUFFICIENT</strong>: when some (not all) faculty of a multi-faculty
+              activity are absent, the remaining team keeps the class running — no substitution is generated.
+            </p>
+          </CardHeader>
+          <CardBody>
+            <div className="space-y-2">
+              {teamContinues.map(entry => {
+                const absentHere = entry.facultyIds.filter(f => absentIds.has(f))
+                const remaining = (entry.facultyList ?? [])
+                  .filter(f => !absentIds.has(f.id))
+                  .map(f => f.name)
+                return (
+                  <div key={entry.id} className="flex flex-wrap items-center gap-3 p-3 bg-white border border-primary-200 rounded-lg text-sm">
+                    <span className="font-medium text-secondary-900">
+                      {entry.section?.name} - {entry.subject?.name}
+                    </span>
+                    <span className="text-secondary-500">{periodLabel(entry)}</span>
+                    <Badge variant="danger">Absent: {absentHere.map(id => entry.facultyList?.find(f => f.id === id)?.name ?? 'Faculty').join(', ')}</Badge>
+                    <Badge variant="success">Continuing: {remaining.join(', ')}</Badge>
+                  </div>
+                )
+              })}
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
       {runData && runData.uncovered.length > 0 && (
         <Card className="border-danger-200 bg-danger-50">
           <CardHeader>
@@ -276,7 +357,11 @@ export function SubstitutionPlanner() {
                           {entry?.section?.name} - {entry?.subject?.name}
                         </p>
                         <p className="text-sm text-secondary-500">
-                          {entry?.timeSlot?.name} • {entry?.faculty?.name} (Absent)
+                          {periodLabel(entry)} • Original: {(entry?.facultyList ?? []).map((f: any) => f.name).join(', ') || entry?.faculty?.name || 'No faculty'}
+                          {(() => {
+                            const absentHere = (entry?.facultyList ?? []).filter((f: any) => absentIds.has(f.id))
+                            return absentHere.length > 0 ? ` — absent: ${absentHere.map((f: any) => f.name).join(', ')}` : ''
+                          })()}
                         </p>
                         <p className="text-sm text-danger-600 mt-1">{uncovered.reason}</p>
                       </div>
@@ -321,6 +406,7 @@ export function SubstitutionPlanner() {
                 <AssignmentRow
                   key={assignment.id}
                   assignment={assignment}
+                  absentIds={absentIds}
                   onUpdate={handleUpdateAssignment}
                   onLock={handleLock}
                   onUnlock={handleUnlock}
@@ -336,9 +422,17 @@ export function SubstitutionPlanner() {
       {runData && revisedTimetable.length > 0 && (
         <Card data-testid="revised-timetable">
           <CardHeader>
-            <div className="flex items-center gap-2">
-              <Table2 className="h-5 w-5 text-primary-600" aria-hidden="true" />
-              <h3 className="text-lg font-semibold text-secondary-900">Revised Timetable — {dayName}</h3>
+            <div className="flex items-center justify-between w-full gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Table2 className="h-5 w-5 text-primary-600" aria-hidden="true" />
+                <h3 className="text-lg font-semibold text-secondary-900">Revised Timetable — {dayName}</h3>
+              </div>
+              <Link to="/revised">
+                <Button variant="outline" size="sm">
+                  Open Full Timetable
+                  <ArrowRight className="h-4 w-4" />
+                </Button>
+              </Link>
             </div>
             <p className="text-sm text-secondary-500">
               The full day view with substitutions applied (master timetable entries are never modified).
@@ -362,23 +456,29 @@ export function SubstitutionPlanner() {
                   {revisedTimetable.map((row: any, index: number) => {
                     const entry = row.originalEntry
                     const substitution = row.substitution
+                    const partiallyAbsent = (() => {
+                      const a = (entry?.facultyIds ?? []).filter((f: string) => absentIds.has(f)).length
+                      return a > 0 && a < (entry?.facultyIds?.length ?? 0)
+                    })()
                     const status = row.isSubstituted
                       ? (substitution?.isLocked ? 'Locked' : 'Substituted')
                       : substitution
                         ? 'Uncovered'
-                        : 'As Scheduled'
+                        : partiallyAbsent
+                          ? 'Team continues'
+                          : 'As Scheduled'
                     return (
                       <tr key={index} className={cn(substitution && (row.isSubstituted ? 'bg-primary-50/50' : 'bg-danger-50'))}>
-                        <td className="px-4 py-2 whitespace-nowrap text-secondary-700">{entry?.timeSlot?.name}</td>
+                        <td className="px-4 py-2 whitespace-nowrap text-secondary-700">{periodLabel(entry)}</td>
                         <td className="px-4 py-2 whitespace-nowrap text-secondary-900">{entry?.section?.name}</td>
                         <td className="px-4 py-2 text-secondary-700">{entry?.subject?.name}</td>
-                        <td className="px-4 py-2 text-secondary-700">{entry?.faculty?.name}</td>
+                        <td className="px-4 py-2 text-secondary-700">{(entry?.facultyList ?? []).map((f: any) => f.name).join(', ') || 'No faculty'}</td>
                         <td className={cn('px-4 py-2', row.isSubstituted ? 'font-medium text-primary-700' : 'text-secondary-500')}>
                           {row.substituteFaculty?.name || '—'}
                         </td>
-                        <td className="px-4 py-2 text-secondary-700">{entry?.room?.name || '—'}</td>
+                        <td className="px-4 py-2 text-secondary-700">{(entry?.roomList ?? []).map((r: any) => r.name).join(', ') || '—'}</td>
                         <td className="px-4 py-2">
-                          <Badge variant={status === 'Locked' ? 'warning' : status === 'Substituted' ? 'success' : status === 'Uncovered' ? 'danger' : 'neutral'}>
+                          <Badge variant={status === 'Locked' ? 'warning' : status === 'Substituted' ? 'success' : status === 'Uncovered' ? 'danger' : status === 'Team continues' ? 'info' : 'neutral'}>
                             {status}
                           </Badge>
                         </td>
@@ -453,6 +553,7 @@ export function SubstitutionPlanner() {
 
 function AssignmentRow({ 
   assignment, 
+  absentIds,
   onUpdate, 
   onLock, 
   onUnlock, 
@@ -460,6 +561,7 @@ function AssignmentRow({
   availableFaculty 
 }: { 
   assignment: any
+  absentIds: Set<string>
   onUpdate: (id: string, facultyId: string | null) => void
   onLock: (id: string) => void
   onUnlock: (id: string) => void
@@ -470,6 +572,8 @@ function AssignmentRow({
   const isLocked = assignment.isLocked
   const hasSubstitute = !!assignment.substituteFacultyId
   const isUncovered = !hasSubstitute
+  const originalTeam = entry?.facultyList ?? (entry?.faculty ? [entry.faculty] : [])
+  const absentHere = originalTeam.filter((f: any) => absentIds.has(f.id))
 
   // The current substitute stays selectable even if a later change (another
   // substitution, the daily limit) would make them ineligible for a fresh pick.
@@ -496,10 +600,29 @@ function AssignmentRow({
               <Badge variant="info">Score: {Math.round(assignment.score)}</Badge>
             )}
           </div>
-          <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-secondary-500">
-            <span>{entry?.timeSlot?.name}</span>
-            <span>Original: {entry?.faculty?.name}</span>
-            {hasSubstitute && <span className="text-primary-700 font-medium">Substitute: {assignment.substituteFaculty?.name}</span>}
+          <div className="flex flex-wrap items-center gap-3 mt-2 text-sm">
+            <span className="text-secondary-600">
+              {entry?.span > 1 ? timeRangeLabel(entry.timeSlotId, entry.span) : entry?.timeSlot?.name}
+            </span>
+            <span className="text-secondary-500">
+              Original Faculty: {originalTeam.map((f: any) => f.name).join(', ') || 'No faculty'}
+            </span>
+            {absentHere.length > 0 && (
+              <Badge variant="danger">Absent: {absentHere.map((f: any) => f.name).join(', ')}</Badge>
+            )}
+            {hasSubstitute && (
+              <span className="inline-flex items-center gap-2 text-primary-700 font-semibold">
+                <ArrowRight className="h-3.5 w-3.5" />
+                Substitute Faculty: {assignment.substituteFaculty?.name}
+                <Badge variant="success">SUBSTITUTE</Badge>
+              </span>
+            )}
+            {!hasSubstitute && (
+              <span className="inline-flex items-center gap-1 text-danger-600 font-medium">
+                <ArrowRight className="h-3.5 w-3.5" />
+                No substitute found
+              </span>
+            )}
           </div>
           {assignment.reasoning && (
             <p className="text-xs text-secondary-400 mt-1">{assignment.reasoning}</p>

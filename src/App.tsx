@@ -4,6 +4,7 @@ import { Layout } from '@/components/layout/Layout'
 import { Dashboard } from '@/pages/Dashboard'
 import { Attendance } from '@/pages/Attendance'
 import { SubstitutionPlanner } from '@/pages/SubstitutionPlanner'
+import { RevisedTimetable } from '@/pages/RevisedTimetable'
 import { MasterTimetable } from '@/pages/MasterTimetable'
 import { Faculty } from '@/pages/Faculty'
 import { Subjects } from '@/pages/Subjects'
@@ -41,6 +42,7 @@ function App() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="attendance" element={<Attendance />} />
           <Route path="substitution" element={<SubstitutionPlanner />} />
+          <Route path="revised" element={<RevisedTimetable />} />
           <Route path="timetable" element={<MasterTimetable />} />
           <Route path="faculty" element={<Faculty />} />
           <Route path="subjects" element={<Subjects />} />

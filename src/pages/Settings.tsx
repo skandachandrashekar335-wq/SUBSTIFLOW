@@ -7,8 +7,8 @@ import { Select, SelectOption } from '@/components/ui/Select'
 import { Checkbox } from '@/components/ui/Checkbox'
 import { Dialog, DialogHeader, DialogContent, DialogFooter } from '@/components/ui/Dialog'
 import { useAppStore } from '@/stores/appStore'
-import { settingsRepository, academicYearRepository, departmentRepository, timeSlotRepository } from '@/db/repositories'
-import { SubstitutionWeights, DEFAULT_SUBSTITUTION_WEIGHTS, AcademicYear, Department, TimeSlot, DayOfWeek, DAYS_OF_WEEK } from '@/types'
+import { settingsRepository, academicYearRepository, departmentRepository, timeSlotRepository, termRepository } from '@/db/repositories'
+import { SubstitutionWeights, DEFAULT_SUBSTITUTION_WEIGHTS, AcademicYear, Department, TimeSlot, DayOfWeek, DAYS_OF_WEEK, MultiFacultyAbsencePolicy } from '@/types'
 import { cn } from '@/utils/cn'
 
 type WorkingHours = { startTime: string; endTime: string; breakStart: string; breakEnd: string }
@@ -54,6 +54,10 @@ export function Settings() {
   const [weightDraft, setWeightDraft] = useState<Record<string, string>>({})
   // P5 toggle: may substitutions go to faculty unrelated to the affected class?
   const [allowUnrelatedDraft, setAllowUnrelatedDraft] = useState(true)
+  // Multi-faculty absence policy: TEAM_SUFFICIENT (default) or REPLACE_ABSENT.
+  const [policyDraft, setPolicyDraft] = useState<MultiFacultyAbsencePolicy>(
+    settingsRepository.getMultiFacultyAbsencePolicy()
+  )
   const [rulesError, setRulesError] = useState<string | null>(null)
 
   const [academicYears, setAcademicYears] = useState<AcademicYear[]>([])
@@ -205,6 +209,7 @@ export function Settings() {
     try {
       settingsRepository.setSubstitutionWeights(parsed)
       settingsRepository.setAllowUnrelatedSubstitutions(allowUnrelatedDraft)
+      settingsRepository.setMultiFacultyAbsencePolicy(policyDraft)
       setRulesError(null)
       showSaved()
     } catch (error) {
@@ -217,6 +222,7 @@ export function Settings() {
       Object.fromEntries(Object.entries(DEFAULT_SUBSTITUTION_WEIGHTS).map(([key, value]) => [key, String(value)]))
     )
     setAllowUnrelatedDraft(true)
+    setPolicyDraft('TEAM_SUFFICIENT')
     setRulesError(null)
   }
 
@@ -595,6 +601,28 @@ export function Settings() {
         className="space-y-4"
         hidden={activeTab !== 'academic'}
       >
+          {(() => {
+            const term = termRepository.getActive()
+            if (!term) return null
+            const today = new Date().toISOString().slice(0, 10)
+            const inTerm = today >= term.startDate && today <= term.endDate
+            return (
+              <Card className={inTerm ? 'border-primary-200 bg-primary-50/40' : 'border-warning-200 bg-warning-50/40'}>
+                <CardBody className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-secondary-700">Timetable validity (term)</p>
+                    <p className="text-lg font-semibold text-secondary-900">{term.name}</p>
+                    <p className="text-sm text-secondary-500">
+                      {term.startDate} to {term.endDate} · answers “which timetable is effective today?” for the {new Date().getFullYear()} calendar
+                    </p>
+                  </div>
+                  <span className={inTerm ? 'badge bg-primary-100 text-primary-700' : 'badge bg-warning-100 text-warning-700'}>
+                    {inTerm ? 'IN TERM' : 'OUTSIDE TERM'}
+                  </span>
+                </CardBody>
+              </Card>
+            )
+          })()}
           <Card>
             <CardHeader className="flex items-center justify-between">
               <div>
@@ -722,6 +750,25 @@ export function Settings() {
                 </p>
               </span>
             </label>
+            <div className="rounded-lg border border-secondary-200 p-3 space-y-2">
+              <label htmlFor="multi-faculty-policy" className="block text-sm font-medium text-secondary-700">
+                When SOME faculty of a multi-faculty activity are absent (labs, team-taught classes)
+              </label>
+              <Select
+                id="multi-faculty-policy"
+                value={policyDraft}
+                onChange={(v) => setPolicyDraft(v as MultiFacultyAbsencePolicy)}
+                options={[
+                  { value: 'TEAM_SUFFICIENT', label: 'Team sufficient — the remaining team keeps the class running (no substitution)' },
+                  { value: 'REPLACE_ABSENT', label: 'Replace absent — generate a substitution for the absent member(s)' },
+                ]}
+              />
+              <p className="text-xs text-secondary-500">
+                Explicit, configurable choice — the system never decides silently. If ALL faculty of an
+                activity are absent, it is always affected regardless of this policy. Activities with no
+                faculty (library, mentoring, …) are never affected.
+              </p>
+            </div>
             {weightFields.map(field => (
               <div key={field.key} className="flex items-center justify-between gap-4">
                 <div className="flex-1">

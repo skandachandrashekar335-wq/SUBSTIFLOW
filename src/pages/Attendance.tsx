@@ -10,7 +10,7 @@ import { Card, CardHeader, CardBody } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Input } from '@/components/ui/Input'
 import { useAppStore } from '@/stores/appStore'
-import { facultyRepository, attendanceRepository, departmentRepository } from '@/db/repositories'
+import { facultyRepository, attendanceRepository, departmentRepository, auditLogRepository, AUDIT_ACTIONS } from '@/db/repositories'
 import { cn } from '@/utils/cn'
 import { parseISODate, todayISO } from '@/utils/date'
 
@@ -56,6 +56,13 @@ export function Attendance() {
       const currentStatus = attendanceMap.get(facultyId) || 'PRESENT'
       const newStatus = currentStatus === 'PRESENT' ? 'ABSENT' : 'PRESENT'
       attendanceRepository.upsert(today, facultyId, newStatus)
+      const name = faculty.find(f => f.id === facultyId)?.name ?? facultyId
+      auditLogRepository.record(
+        AUDIT_ACTIONS.ATTENDANCE_MARKED,
+        'attendance',
+        facultyId,
+        `${name} marked ${newStatus.toLowerCase()} for ${today}`
+      )
       setAttendanceVersion(v => v + 1)
     } catch (error) {
       alert(error instanceof Error ? error.message : 'Could not save attendance. Please try again.')
@@ -66,6 +73,12 @@ export function Attendance() {
     try {
       const facultyIds = faculty.map(f => f.id)
       attendanceRepository.initializeAllPresent(today, facultyIds)
+      auditLogRepository.record(
+        AUDIT_ACTIONS.ATTENDANCE_MARKED,
+        'attendance',
+        undefined,
+        `All ${facultyIds.length} faculty marked present for ${today}`
+      )
       setAttendanceVersion(v => v + 1)
     } catch (error) {
       alert(error instanceof Error ? error.message : 'Could not save attendance. Please try again.')

@@ -6,9 +6,11 @@ import { Card, CardBody } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Input } from '@/components/ui/Input'
 import { Select, SelectOption } from '@/components/ui/Select'
+import { MultiSelect } from '@/components/ui/MultiSelect'
 import { Dialog, DialogHeader, DialogContent, DialogFooter } from '@/components/ui/Dialog'
 import { useAppStore } from '@/stores/appStore'
-import { timetableEntryRepository, sectionRepository, facultyRepository, subjectRepository, roomRepository, timeSlotRepository, settingsRepository } from '@/db/repositories'
+import { timetableEntryRepository, sectionRepository, facultyRepository, subjectRepository, roomRepository, timeSlotRepository, settingsRepository, termRepository } from '@/db/repositories'
+import { todayISO } from '@/utils/date'
 import {
   createTimetableEntry,
   updateTimetableEntry,
@@ -17,24 +19,39 @@ import {
   buildQuickEntryInput,
   buildAddEntryDefaults,
   findFreeRoomId,
-  subjectsForFaculty,
+  subjectsForTeam,
   facultyForSubject,
-  reconcileFacultyChange,
-  reconcileSubjectChange,
+  reconcileTeamChange,
+  TimetableConflictError,
   NO_SUBJECTS_FOR_FACULTY,
   NO_FACULTY_FOR_SUBJECT,
 } from '@/services/timetable'
-import type { QuickEntryContext } from '@/services/timetable'
-import { TimetableEntryWithRelations, DayOfWeek, ClassType, CLASS_TYPES, DAYS_OF_WEEK } from '@/types'
+import type { QuickEntryContext, TimetableConflict } from '@/services/timetable'
+import { TimetableEntryWithRelations, DayOfWeek, ClassType, CLASS_TYPES, DAYS_OF_WEEK, classTypeLabel } from '@/types'
 import { cn } from '@/utils/cn'
 
 const emptyQuickForm = {
-  facultyId: '',
+  facultyIds: [] as string[],
   subjectId: '',
-  roomId: '',
+  roomIds: [] as string[],
   classType: 'LECTURE' as ClassType,
   sectionId: '',
+  span: 1,
 }
+
+/** Shown when a team (2+ faculty) leaves no subject everyone is linked to. */
+const NO_SUBJECTS_FOR_TEAM = 'No subjects are linked to every selected faculty member.'
+
+const emptyFormData = (workingDays: string[]) => ({
+  dayOfWeek: (workingDays[0] ?? 'MONDAY') as DayOfWeek,
+  timeSlotId: '',
+  sectionId: '',
+  subjectId: '',
+  facultyIds: [] as string[],
+  roomIds: [] as string[],
+  classType: 'LECTURE' as ClassType,
+  span: 1,
+})
 
 export function MasterTimetable() {
   const { currentAcademicYear } = useAppStore()
@@ -46,20 +63,18 @@ export function MasterTimetable() {
   const [showForm, setShowForm] = useState(false)
   const [editingEntry, setEditingEntry] = useState<TimetableEntryWithRelations | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
-  const [formData, setFormData] = useState({
-    dayOfWeek: (settingsRepository.getWorkingDays()[0] ?? 'MONDAY') as DayOfWeek,
-    timeSlotId: '',
-    sectionId: '',
-    subjectId: '',
-    facultyId: '',
-    roomId: '',
-    classType: 'LECTURE' as ClassType,
-  })
+  const [formData, setFormData] = useState(emptyFormData(settingsRepository.getWorkingDays()))
   // Context-aware quick form (clicking an empty cell): day, time and — when a
   // class filter is active — the section come from the cell itself.
   const [quickContext, setQuickContext] = useState<QuickEntryContext | null>(null)
   const [quickError, setQuickError] = useState<string | null>(null)
   const [quickData, setQuickData] = useState(emptyQuickForm)
+  // Conflict resolution: never overwrite silently — the coordinator chooses.
+  const [conflict, setConflict] = useState<{
+    conflicts: TimetableConflict[]
+    retry: () => void
+  } | null>(null)
+  const [conflictError, setConflictError] = useState<string | null>(null)
 
   const sections = useMemo(() => 
     currentAcademicYear ? sectionRepository.findByAcademicYear(currentAcademicYear.id) : [], 
@@ -84,23 +99,24 @@ export function MasterTimetable() {
   const filteredEntries = useMemo(() => {
     return entries.filter(entry => {
       if (selectedSection && entry.sectionId !== selectedSection) return false
-      if (selectedFaculty && entry.facultyId !== selectedFaculty) return false
+      // Team membership: a member of a multi-faculty activity matches too.
+      if (selectedFaculty && !entry.facultyIds.includes(selectedFaculty)) return false
       if (selectedSubject && entry.subjectId !== selectedSubject) return false
       if (searchQuery) {
         const search = searchQuery.toLowerCase()
         const matches = 
           entry.section?.name.toLowerCase().includes(search) ||
           entry.subject?.name.toLowerCase().includes(search) ||
-          entry.faculty?.name.toLowerCase().includes(search) ||
-          entry.room?.name.toLowerCase().includes(search)
+          (entry.facultyList ?? []).some(f => f.name.toLowerCase().includes(search)) ||
+          (entry.roomList ?? []).some(r => r.name.toLowerCase().includes(search))
         if (!matches) return false
       }
       return true
     })
   }, [entries, selectedSection, selectedFaculty, selectedSubject, searchQuery])
 
-  // Every entry for the cell — several sections can run in the same period,
-  // so the grid must not silently show only one of them.
+  // Every entry STARTING in the cell — several sections can run in the same
+  // period, so the grid must not silently show only one of them.
   const gridData = useMemo(() => {
     const data: Record<string, Record<string, TimetableEntryWithRelations[]>> = {}
     for (const day of workingDays) {
@@ -124,6 +140,28 @@ export function MasterTimetable() {
     return data
   }, [filteredEntries, allSlots, workingDays])
 
+  // Continuation cells: periods AFTER an activity's start that its span still
+  // covers (a 09:00–11:00 lab occupies the 10:00 cell as a continuation).
+  const continuationData = useMemo(() => {
+    const data: Record<string, Record<string, TimetableEntryWithRelations[]>> = {}
+    for (const day of workingDays) {
+      data[day] = {}
+      for (const slot of allSlots) data[day][slot.id] = []
+    }
+    const orderIdx = new Map(allSlots.map((s, i) => [s.id, i]))
+    for (const entry of filteredEntries) {
+      if (entry.timeSlot?.isBreak) continue
+      const startIdx = orderIdx.get(entry.timeSlotId)
+      if (startIdx === undefined) continue
+      for (let i = 1; i < Math.max(1, entry.span); i++) {
+        const slot = allSlots[startIdx + i]
+        if (!slot || slot.isBreak) break
+        if (data[entry.dayOfWeek]?.[slot.id]) data[entry.dayOfWeek][slot.id].push(entry)
+      }
+    }
+    return data
+  }, [filteredEntries, allSlots, workingDays])
+
   const offDayEntries = useMemo(
     () => entries.filter(e => !workingDays.includes(e.dayOfWeek)).length,
     [entries, workingDays]
@@ -135,12 +173,77 @@ export function MasterTimetable() {
     }
   }
 
+  // --- Save with conflict resolution ---------------------------------------
+
+  /**
+   * Save attempts go through here: friendly validation errors show inline in
+   * the dialog that submitted; SPAN-AWARE conflicts open the resolution
+   * dialog (Keep existing / Replace existing) — nothing is ever overwritten
+   * silently.
+   */
+  const saveWithConflictHandling = (save: () => void, onError: (msg: string) => void) => {
+    try {
+      save()
+    } catch (error) {
+      if (error instanceof TimetableConflictError) {
+        setConflictError(null)
+        setConflict({ conflicts: error.conflicts, retry: save })
+      } else {
+        onError(
+          error instanceof Error ? error.message : 'Could not save the timetable entry. Please try again.'
+        )
+      }
+    }
+  }
+
+  /** Coordinator picked "Replace Existing": drop the clashing entries (and
+   *  their substitution history), then retry the exact same save. */
+  const handleConflictReplace = () => {
+    if (!conflict) return
+    const { conflicts, retry } = conflict
+    try {
+      for (const c of conflicts) {
+        try {
+          deleteTimetableEntry(c.entryId)
+        } catch {
+          // Already removed (e.g. duplicate conflicts on one entry) — retry
+          // will tell us if anything is actually wrong.
+        }
+      }
+      retry()
+      setConflict(null)
+      reloadEntries()
+    } catch (error) {
+      setConflictError(
+        error instanceof TimetableConflictError
+          ? error.conflicts.map(c => c.message).join('\n')
+          : error instanceof Error
+            ? error.message
+            : 'Could not save the timetable entry. Please try again.'
+      )
+    }
+  }
+
+  /** Keep Existing: existing entries stay untouched; this save is abandoned. */
+  const handleConflictKeep = () => {
+    setConflict(null)
+    setShowForm(false)
+    setEditingEntry(null)
+    setQuickContext(null)
+  }
+
+  /** Cancel: back to the form to adjust the input (nothing was saved). */
+  const handleConflictCancel = () => {
+    setConflictError(null)
+    setConflict(null)
+  }
+
   // --- Full form (Add Entry / edit) ----------------------------------------
 
   const handleSubmit = () => {
     if (!currentAcademicYear) return
     setFormError(null)
-    try {
+    saveWithConflictHandling(() => {
       if (editingEntry) {
         updateTimetableEntry(editingEntry.id, formData)
       } else {
@@ -148,20 +251,9 @@ export function MasterTimetable() {
       }
       setShowForm(false)
       setEditingEntry(null)
-      setFormData({
-        dayOfWeek: workingDays[0] ?? 'MONDAY',
-        timeSlotId: '',
-        sectionId: '',
-        subjectId: '',
-        facultyId: '',
-        roomId: '',
-        classType: 'LECTURE',
-      })
+      setFormData(emptyFormData(workingDays))
       reloadEntries()
-    } catch (error) {
-      // The dialog stays open so the coordinator can correct the input.
-      setFormError(error instanceof Error ? error.message : 'Could not save the timetable entry. Please try again.')
-    }
+    }, setFormError)
   }
 
   const handleEdit = (entry: TimetableEntryWithRelations) => {
@@ -173,9 +265,10 @@ export function MasterTimetable() {
       timeSlotId: entry.timeSlotId,
       sectionId: entry.sectionId,
       subjectId: entry.subjectId,
-      facultyId: entry.facultyId,
-      roomId: entry.roomId,
+      facultyIds: [...entry.facultyIds],
+      roomIds: [...entry.roomIds],
       classType: entry.classType,
+      span: entry.span,
     })
     setShowForm(true)
   }
@@ -193,18 +286,31 @@ export function MasterTimetable() {
   }
 
   /**
-   * Faculty changed → a now-unlinked subject is cleared (it must be picked
-   * again from the filtered list; an invalid combination is never savable).
+   * Team changed → a now-unshared subject is cleared (it must be picked again
+   * from the list filtered to everyone still selected; an invalid combination
+   * is never savable).
    */
-  const handleFullFacultyChange = (value: string) => {
-    const result = reconcileFacultyChange(value, formData.subjectId)
-    setFormData(prev => ({ ...prev, facultyId: value, subjectId: result.subjectId }))
+  const handleFullFacultyChange = (ids: string[]) => {
+    const result = reconcileTeamChange(ids, formData.subjectId)
+    setFormData(prev => ({ ...prev, facultyIds: ids, subjectId: result.subjectId }))
   }
 
-  /** Subject changed → mirror rule for subject-first selection. */
+  /** Subject changed → drop team members not linked to it (mirror rule). */
   const handleFullSubjectChange = (value: string) => {
-    const result = reconcileSubjectChange(formData.facultyId, value)
-    setFormData(prev => ({ ...prev, subjectId: value, facultyId: result.facultyId }))
+    const qualified = new Set(facultyForSubject(value, faculty).map(f => f.id))
+    setFormData(prev => ({
+      ...prev,
+      subjectId: value,
+      facultyIds: prev.facultyIds.filter(id => qualified.has(id)),
+    }))
+  }
+
+  /** Start period changed → duration clamped to what actually fits. */
+  const handleFullSlotChange = (value: string) => {
+    setFormData(prev => {
+      const maxSpan = spanOptionCount(value)
+      return { ...prev, timeSlotId: value, span: Math.max(1, Math.min(prev.span, maxSpan)) }
+    })
   }
 
   // --- Context-aware quick entry -------------------------------------------
@@ -222,7 +328,10 @@ export function MasterTimetable() {
       ...emptyQuickForm,
       sectionId: selectedSection || '',
       // Sensible default: a room that is free at this time.
-      roomId: findFreeRoomId({ day, timeSlotId: slotId, entries, rooms }),
+      roomIds: (() => {
+        const free = findFreeRoomId({ day, timeSlotId: slotId, entries, rooms, allSlots })
+        return free ? [free] : []
+      })(),
     })
   }
 
@@ -244,20 +353,20 @@ export function MasterTimetable() {
     openQuickEntry(action.context.dayOfWeek, action.context.timeSlotId)
   }
 
-  const handleQuickFacultyChange = (value: string) => {
-    const result = reconcileFacultyChange(value, quickData.subjectId)
-    setQuickData(prev => ({ ...prev, facultyId: value, subjectId: result.subjectId }))
+  const handleQuickFacultyChange = (ids: string[]) => {
+    const result = reconcileTeamChange(ids, quickData.subjectId)
+    setQuickData(prev => ({ ...prev, facultyIds: ids, subjectId: result.subjectId }))
   }
 
   const handleQuickSubjectChange = (value: string) => {
-    const result = reconcileSubjectChange(quickData.facultyId, value)
+    const qualified = new Set(facultyForSubject(value, faculty).map(f => f.id))
     const subject = subjects.find(s => s.id === value)
     setQuickData(prev => ({
       ...prev,
       subjectId: value,
-      facultyId: result.facultyId,
       // Sensible default: the subject's own class type.
       classType: subject?.defaultClassType ?? prev.classType,
+      facultyIds: prev.facultyIds.filter(id => qualified.has(id)),
     }))
   }
 
@@ -265,21 +374,20 @@ export function MasterTimetable() {
     if (!currentAcademicYear || !quickContext) return
     setQuickError(null)
     const sectionId = quickContext.sectionId || quickData.sectionId
-    try {
+    saveWithConflictHandling(() => {
       const input = buildQuickEntryInput({
         context: quickContext,
         sectionId,
-        facultyId: quickData.facultyId,
+        facultyIds: quickData.facultyIds,
         subjectId: quickData.subjectId,
-        roomId: quickData.roomId,
+        roomIds: quickData.roomIds,
         classType: quickData.classType,
+        span: quickData.span,
       })
       createTimetableEntry(input, currentAcademicYear.id)
       setQuickContext(null)
       reloadEntries()
-    } catch (error) {
-      setQuickError(error instanceof Error ? error.message : 'Could not save the timetable entry. Please try again.')
-    }
+    }, setQuickError)
   }
 
   // --- Select options -------------------------------------------------------
@@ -292,9 +400,29 @@ export function MasterTimetable() {
   const roomFormOptions: SelectOption[] = rooms.map(r => ({ value: r.id, label: r.name }))
   const classTypeOptions: SelectOption[] = CLASS_TYPES.map(c => ({ value: c.value, label: c.label }))
 
+  /** Duration choices that FIT from a start period (stops before the break / end of day). */
+  const spanOptionsFor = (startSlotId: string): SelectOption[] => {
+    const startIdx = allSlots.findIndex(s => s.id === startSlotId)
+    if (startIdx < 0) return [{ value: '1', label: '1 period' }]
+    const start = allSlots[startIdx]
+    const opts: SelectOption[] = []
+    for (let n = 1; n <= 4; n++) {
+      const end = allSlots[startIdx + n - 1]
+      if (!end || end.isBreak) break
+      opts.push({
+        value: String(n),
+        label: `${n} period${n > 1 ? 's' : ''} (${start.startTime}–${end.endTime})`,
+      })
+    }
+    return opts
+  }
+  const spanOptionCount = (startSlotId: string) => spanOptionsFor(startSlotId).length
+  const fullSpanOptions = spanOptionsFor(formData.timeSlotId)
+  const quickSpanOptions = spanOptionsFor(quickContext?.timeSlotId ?? '')
+
   // Faculty↔subject filtering (both directions) with the current selection
   // kept visible so an existing entry can always be opened for editing.
-  const baseSubjectOptions = subjectsForFaculty(formData.facultyId, subjects)
+  const baseSubjectOptions = subjectsForTeam(formData.facultyIds, subjects)
   const subjectFormOptions: SelectOption[] = (() => {
     const current = formData.subjectId && !baseSubjectOptions.some(s => s.id === formData.subjectId)
       ? subjects.find(s => s.id === formData.subjectId)
@@ -303,22 +431,35 @@ export function MasterTimetable() {
   })()
   const baseFacultyOptions = facultyForSubject(formData.subjectId, faculty)
   const facultyFormOptions: SelectOption[] = (() => {
-    const current = formData.facultyId && !baseFacultyOptions.some(f => f.id === formData.facultyId)
-      ? faculty.find(f => f.id === formData.facultyId)
-      : undefined
-    return [...baseFacultyOptions, ...(current ? [current] : [])].map(f => ({ value: f.id, label: f.name }))
+    const extras = formData.facultyIds
+      .map(id => faculty.find(f => f.id === id))
+      .filter((f): f is (typeof faculty)[number] => Boolean(f) && !baseFacultyOptions.some(b => b.id === f!.id))
+    return [...baseFacultyOptions, ...extras].map(f => ({ value: f.id, label: f.name }))
   })()
   const fullSubjectMessage =
-    formData.facultyId && subjectFormOptions.length === 0 ? NO_SUBJECTS_FOR_FACULTY : undefined
+    formData.facultyIds.length > 0 && subjectFormOptions.length === 0
+      ? formData.facultyIds.length === 1
+        ? NO_SUBJECTS_FOR_FACULTY
+        : NO_SUBJECTS_FOR_TEAM
+      : undefined
   const fullFacultyMessage =
     formData.subjectId && facultyFormOptions.length === 0 ? NO_FACULTY_FOR_SUBJECT : undefined
 
-  const quickSubjectOptions: SelectOption[] = subjectsForFaculty(quickData.facultyId, subjects)
-    .map(s => ({ value: s.id, label: s.name }))
-  const quickFacultyOptions: SelectOption[] = facultyForSubject(quickData.subjectId, faculty)
-    .map(f => ({ value: f.id, label: f.name }))
+  const quickBaseSubjectOptions = subjectsForTeam(quickData.facultyIds, subjects)
+  const quickSubjectOptions: SelectOption[] = quickBaseSubjectOptions.map(s => ({ value: s.id, label: s.name }))
+  const quickBaseFacultyOptions = facultyForSubject(quickData.subjectId, faculty)
+  const quickFacultyOptions: SelectOption[] = (() => {
+    const extras = quickData.facultyIds
+      .map(id => faculty.find(f => f.id === id))
+      .filter((f): f is (typeof faculty)[number] => Boolean(f) && !quickBaseFacultyOptions.some(b => b.id === f!.id))
+    return [...quickBaseFacultyOptions, ...extras].map(f => ({ value: f.id, label: f.name }))
+  })()
   const quickSubjectMessage =
-    quickData.facultyId && quickSubjectOptions.length === 0 ? NO_SUBJECTS_FOR_FACULTY : undefined
+    quickData.facultyIds.length > 0 && quickSubjectOptions.length === 0
+      ? quickData.facultyIds.length === 1
+        ? NO_SUBJECTS_FOR_FACULTY
+        : NO_SUBJECTS_FOR_TEAM
+      : undefined
   const quickFacultyMessage =
     quickData.subjectId && quickFacultyOptions.length === 0 ? NO_FACULTY_FOR_SUBJECT : undefined
 
@@ -342,6 +483,13 @@ export function MasterTimetable() {
     .filter((d): d is (typeof DAYS_OF_WEEK)[number] => Boolean(d))
     .map(d => ({ value: d.value, label: d.label }))
 
+  // With a single class selected every cell holds at most that class's entry:
+  // activities render as TRUE column spans (the lab's second hour is skipped,
+  // not duplicated) and rows stay aligned with the header. Unfiltered, several
+  // classes share a cell, so spans become continuation chips instead (no
+  // column shifting).
+  const spanMode = Boolean(selectedSection)
+
   if (!currentAcademicYear) {
     return (
       <div className="max-w-4xl mx-auto text-center py-12">
@@ -358,11 +506,25 @@ export function MasterTimetable() {
         <div>
           <h1 className="text-2xl font-bold text-secondary-900">Master Timetable</h1>
           <p className="text-secondary-500">{currentAcademicYear.name}</p>
+          {(() => {
+            // Effective-date context: which timetable is active today?
+            const term = termRepository.getActive()
+            if (!term) return null
+            const today = todayISO()
+            const inTerm = today >= term.startDate && today <= term.endDate
+            return (
+              <p className={`text-sm mt-1 ${inTerm ? 'text-primary-700' : 'text-warning-700'}`}>
+                {inTerm ? 'Effective' : 'Outside term'}: {term.name}
+                <span className="text-secondary-400"> · </span>
+                <span className="text-secondary-500">{term.startDate} to {term.endDate}</span>
+              </p>
+            )
+          })()}
         </div>
         <Button onClick={() => {
           // QA-011 + QA-012: every Add Entry open starts a genuinely fresh
-          // draft. Faculty/Subject/Day/Class Type are reset (a cancelled or
-          // edited draft must never leak into the next one) and Time
+          // draft. Team/Subject/Day/Class Type/Duration are reset (a cancelled
+          // or edited draft must never leak into the next one) and Time
           // Slot/Section/Room are initialized to exactly what their selects
           // display (first option, or the grid's class filter for Section) —
           // displayed values, form state and submitted values always agree.
@@ -370,16 +532,20 @@ export function MasterTimetable() {
           setFormError(null)
           setQuickContext(null)
           setFormData({
-            dayOfWeek: workingDays[0] ?? 'MONDAY',
-            ...buildAddEntryDefaults({
-              selectedSectionId: selectedSection,
-              teachingSlots,
-              sections,
-              rooms,
-            }),
-            facultyId: '',
+            dayOfWeek: (workingDays[0] ?? 'MONDAY') as DayOfWeek,
+            ...(() => {
+              const d = buildAddEntryDefaults({
+                selectedSectionId: selectedSection,
+                teachingSlots,
+                sections,
+                rooms,
+              })
+              return { timeSlotId: d.timeSlotId, sectionId: d.sectionId, roomIds: d.roomId ? [d.roomId] : [] }
+            })(),
+            facultyIds: [],
             subjectId: '',
             classType: 'LECTURE',
+            span: 1,
           })
           setShowForm(true)
         }}>
@@ -397,7 +563,7 @@ export function MasterTimetable() {
           {selectedSection && (
             <div className="basis-full flex items-center gap-2 text-sm text-primary-700 bg-primary-50 border border-primary-200 rounded-lg px-3 py-1.5">
               <span className="font-semibold">{sections.find(s => s.id === selectedSection)?.name ?? 'Class selected'}</span>
-              <span>— clicking an empty cell adds a class for this section; day and time are filled in for you.</span>
+              <span>— clicking an empty cell adds a class for this section; day and time are filled in for you. Multi-period activities span their full duration.</span>
             </div>
           )}
           <div className="flex-1" />
@@ -455,7 +621,7 @@ export function MasterTimetable() {
               return (
                 <div key={dayValue} className="contents">
                   <div className="min-w-0 p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">{day?.label ?? dayValue}</div>
-                  {allSlots.map(slot => {
+                  {allSlots.map((slot, slotIdx) => {
                     if (slot.isBreak) {
                       return (
                         <div
@@ -467,9 +633,38 @@ export function MasterTimetable() {
                       )
                     }
                     const cellEntries = gridData[dayValue]?.[slot.id] ?? []
+                    const contEntries = continuationData[dayValue]?.[slot.id] ?? []
+
+                    // Class-filtered: the cell INSIDE a multi-period activity
+                    // is skipped entirely — its start cell spans those tracks,
+                    // keeping the row exactly (1 + periods) tracks wide.
+                    if (spanMode && contEntries.length > 0 && cellEntries.length === 0) {
+                      return null
+                    }
+
+                    // Rendered span must equal 1 + the continuation cells we
+                    // skip: both stop at the break / end of day, so rows stay
+                    // exactly (1 + periods) tracks wide even on bad data.
+                    let maxSpan = 1
+                    if (spanMode && cellEntries.length > 0) {
+                      let fit = 1
+                      for (
+                        let i = slotIdx + 1;
+                        i < allSlots.length && !allSlots[i].isBreak;
+                        i++
+                      ) {
+                        fit++
+                      }
+                      maxSpan = Math.min(
+                        Math.max(1, ...cellEntries.map(e => Math.max(1, e.span))),
+                        fit
+                      )
+                    }
+
                     return (
                       <div
                         key={`${dayValue}-${slot.id}`}
+                        style={maxSpan > 1 ? { gridColumn: `span ${maxSpan}` } : undefined}
                         className="min-h-[70px] min-w-0 p-1.5 border border-secondary-200 cursor-pointer hover:bg-secondary-50 transition-colors text-xs bg-white flex flex-col"
                         onClick={() => handleCellClick(dayValue as DayOfWeek, slot.id)}
                       >
@@ -478,20 +673,54 @@ export function MasterTimetable() {
                             entry balances instead of leaving a lopsided gap.
                             min-w-0 + truncate keeps long names inside the cell. */}
                         <div className="flex-1 flex flex-col justify-center gap-1">
-                          {cellEntries.map(entry => (
+                          {cellEntries.map(entry => {
+                            const teamNames = (entry.facultyList ?? []).map(f => f.name).join(', ')
+                            const roomNames = (entry.roomList ?? []).map(r => r.name).join(', ')
+                            return (
+                              <div
+                                key={entry.id}
+                                className={cn(
+                                  'rounded border px-1.5 py-1 cursor-pointer hover:border-primary-300 transition-colors min-w-0',
+                                  entry.classType === 'LAB' ? 'bg-blue-50 border-blue-200' : 'bg-secondary-50 border-secondary-200'
+                                )}
+                                onClick={(e) => { e.stopPropagation(); handleEdit(entry) }}
+                              >
+                                <div className="font-medium truncate" title={entry.section?.name}>{entry.section?.name}</div>
+                                <div className="truncate text-secondary-600" title={entry.subject?.name}>{entry.subject?.name}</div>
+                                <div
+                                  className={cn('truncate', teamNames ? 'text-secondary-500' : 'text-secondary-400 italic')}
+                                  title={teamNames || 'No faculty'}
+                                >
+                                  {teamNames || 'No faculty'}
+                                </div>
+                                {roomNames && (
+                                  <div className="truncate text-secondary-400" title={roomNames}>{roomNames}</div>
+                                )}
+                                <div className="flex flex-wrap gap-1 mt-0.5">
+                                  <Badge variant="neutral">{classTypeLabel(entry.classType)}</Badge>
+                                  {entry.span > 1 && (
+                                    <Badge variant="info">{entry.span} periods</Badge>
+                                  )}
+                                  {(entry.facultyList?.length ?? 0) > 1 && (
+                                    <Badge variant="info">{entry.facultyList!.length} faculty</Badge>
+                                  )}
+                                </div>
+                              </div>
+                            )
+                          })}
+                          {/* Unfiltered: a multi-period activity's later hours
+                              show as continuation chips (nothing shifts). */}
+                          {!spanMode && contEntries.map(entry => (
                             <div
-                              key={entry.id}
-                              className={cn(
-                                'rounded border px-1.5 py-1 cursor-pointer hover:border-primary-300 transition-colors min-w-0',
-                                entry.classType === 'LAB' ? 'bg-blue-50 border-blue-200' : 'bg-secondary-50 border-secondary-200'
-                              )}
+                              key={`cont-${entry.id}`}
+                              className="rounded border border-dashed border-secondary-300 bg-secondary-50/60 px-1.5 py-1 cursor-pointer hover:border-primary-300 transition-colors min-w-0"
+                              title={`${entry.section?.name} — ${entry.subject?.name} (continues)`}
                               onClick={(e) => { e.stopPropagation(); handleEdit(entry) }}
                             >
-                              <div className="font-medium truncate" title={entry.section?.name}>{entry.section?.name}</div>
-                              <div className="truncate text-secondary-600" title={entry.subject?.name}>{entry.subject?.name}</div>
-                              <div className="truncate text-secondary-500" title={entry.faculty?.name}>{entry.faculty?.name}</div>
-                              <div className="truncate text-secondary-400" title={entry.room?.name}>{entry.room?.name}</div>
-                              <Badge variant="neutral" className="mt-0.5">{entry.classType}</Badge>
+                              <div className="truncate text-[11px] text-secondary-500">
+                                ↳ {entry.section?.name} · {entry.subject?.name}{' '}
+                                <span className="text-secondary-400">continues</span>
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -528,16 +757,9 @@ export function MasterTimetable() {
           )}
           <div className="grid gap-4 md:grid-cols-2">
             <Select label="Day" value={formData.dayOfWeek} onChange={(v) => setFormData(prev => ({ ...prev, dayOfWeek: v as DayOfWeek }))} options={dayOptions} />
-            <Select label="Time Slot" value={formData.timeSlotId} onChange={(v) => setFormData(prev => ({ ...prev, timeSlotId: v }))} options={timeSlotOptions} />
+            <Select label="Time Slot" value={formData.timeSlotId} onChange={handleFullSlotChange} options={timeSlotOptions} />
+            <Select label="Duration" value={String(formData.span)} onChange={(v) => setFormData(prev => ({ ...prev, span: parseInt(v, 10) || 1 }))} options={fullSpanOptions} helperText="Consecutive periods (labs occupy their full length)." />
             <Select label="Section" value={formData.sectionId} onChange={(v) => setFormData(prev => ({ ...prev, sectionId: v }))} options={sectionFormOptions} />
-            <Select
-              label="Faculty"
-              value={formData.facultyId}
-              onChange={handleFullFacultyChange}
-              options={facultyFormOptions}
-              placeholder={facultyFormOptions.length > 0 ? 'Select faculty' : undefined}
-              helperText={fullFacultyMessage}
-            />
             <Select
               label="Subject"
               value={formData.subjectId}
@@ -546,8 +768,23 @@ export function MasterTimetable() {
               placeholder={subjectFormOptions.length > 0 ? 'Select subject' : undefined}
               helperText={fullSubjectMessage}
             />
-            <Select label="Room" value={formData.roomId} onChange={(v) => setFormData(prev => ({ ...prev, roomId: v }))} options={roomFormOptions} />
             <Select label="Class Type" value={formData.classType} onChange={(v) => setFormData(prev => ({ ...prev, classType: v as ClassType }))} options={classTypeOptions} />
+            <MultiSelect
+              label="Teaching Team"
+              value={formData.facultyIds}
+              onChange={handleFullFacultyChange}
+              options={facultyFormOptions}
+              helperText={fullFacultyMessage ?? (formData.facultyIds.length === 0 ? 'Faculty optional for library / mentoring / tutorial / skill-build / COE activities.' : undefined)}
+              emptyText={fullFacultyMessage ?? 'No faculty available'}
+            />
+            <MultiSelect
+              label="Rooms"
+              value={formData.roomIds}
+              onChange={(ids) => setFormData(prev => ({ ...prev, roomIds: ids }))}
+              options={roomFormOptions}
+              helperText={formData.roomIds.length === 0 ? 'Not specified — rooms are optional.' : undefined}
+              emptyText="No rooms configured"
+            />
           </div>
         </DialogContent>
         <DialogFooter>
@@ -607,12 +844,19 @@ export function MasterTimetable() {
             )}
           </div>
           <Select
-            label="Faculty"
-            value={quickData.facultyId}
+            label="Duration"
+            value={String(quickData.span)}
+            onChange={(v) => setQuickData(prev => ({ ...prev, span: parseInt(v, 10) || 1 }))}
+            options={quickSpanOptions}
+            helperText="Consecutive periods (labs occupy their full length)."
+          />
+          <MultiSelect
+            label="Teaching Team"
+            value={quickData.facultyIds}
             onChange={handleQuickFacultyChange}
             options={quickFacultyOptions}
-            placeholder="Select faculty"
-            helperText={quickFacultyMessage}
+            helperText={quickFacultyMessage ?? (quickData.facultyIds.length === 0 ? 'Faculty optional for library / mentoring / tutorial / skill-build / COE activities.' : undefined)}
+            emptyText={quickFacultyMessage ?? 'No faculty available'}
           />
           <Select
             label="Subject"
@@ -624,13 +868,58 @@ export function MasterTimetable() {
             helperText={quickSubjectMessage}
           />
           <div className="grid gap-4 md:grid-cols-2">
-            <Select label="Room" value={quickData.roomId} onChange={(v) => setQuickData(prev => ({ ...prev, roomId: v }))} options={roomFormOptions} />
+            <MultiSelect
+              label="Rooms"
+              value={quickData.roomIds}
+              onChange={(ids) => setQuickData(prev => ({ ...prev, roomIds: ids }))}
+              options={roomFormOptions}
+              helperText={quickData.roomIds.length === 0 ? 'Not specified — rooms are optional.' : undefined}
+              emptyText="No rooms configured"
+            />
             <Select label="Class Type" value={quickData.classType} onChange={(v) => setQuickData(prev => ({ ...prev, classType: v as ClassType }))} options={classTypeOptions} />
           </div>
         </DialogContent>
         <DialogFooter>
           <Button variant="secondary" onClick={() => { setQuickContext(null); setQuickError(null) }}>Cancel</Button>
           <Button onClick={handleQuickSubmit}>Add</Button>
+        </DialogFooter>
+      </Dialog>
+
+      {/* Conflict resolution: the coordinator decides — never a silent overwrite. */}
+      <Dialog open={conflict !== null} onOpenChange={(open) => { if (!open) handleConflictCancel() }}>
+        <DialogHeader title="Schedule Conflict" />
+        <DialogContent className="space-y-4">
+          <p className="text-sm text-secondary-700">
+            This entry clashes with {conflict?.conflicts.length === 1 ? 'an existing entry' : 'existing entries'}:
+          </p>
+          <ul className="space-y-2">
+            {(conflict?.conflicts ?? []).map((c, i) => (
+              <li
+                key={`${c.entryId}-${i}`}
+                className="flex items-start gap-2 p-3 bg-warning-50 border border-warning-200 rounded-lg text-sm text-warning-800"
+              >
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-warning-600" />
+                <span>{c.message}</span>
+              </li>
+            ))}
+          </ul>
+          {conflictError && (
+            <div className="p-3 bg-danger-50 border border-danger-200 rounded-lg text-sm text-danger-700 whitespace-pre-line">
+              {conflictError}
+            </div>
+          )}
+          <div className="text-sm text-secondary-600 space-y-1">
+            <p><strong>Keep Existing</strong> — the entries above stay; this save is cancelled.</p>
+            <p><strong>Replace Existing</strong> — the conflicting entries (and their substitution history) are deleted, then this entry is saved.</p>
+            <p><strong>Cancel</strong> — back to the form to adjust the time, class or team.</p>
+          </div>
+        </DialogContent>
+        <DialogFooter>
+          <div className="flex w-full justify-end gap-3">
+            <Button variant="secondary" onClick={handleConflictCancel}>Cancel</Button>
+            <Button variant="secondary" onClick={handleConflictKeep}>Keep Existing</Button>
+            <Button variant="danger" onClick={handleConflictReplace}>Replace Existing</Button>
+          </div>
         </DialogFooter>
       </Dialog>
     </div>
