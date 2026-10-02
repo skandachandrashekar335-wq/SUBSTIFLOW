@@ -29,7 +29,9 @@ import {
   createTimetableEntry,
   updateTimetableEntry,
   deleteTimetableEntry,
+  detectConflicts,
 } from '@/services/timetable'
+import { runMigrations } from '@/db/migrations'
 import {
   generateSubstitutions,
   getSubstitutionRun,
@@ -72,9 +74,21 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
     }
     testDb = new Database(SNAPSHOT)
     testDb.pragma('foreign_keys = ON')
+    // The snapshot is whatever schema the app last ran (possibly v1): apply
+    // the same migrations the app applies on launch. This exercises the real
+    // migration path against REAL production data on a disposable copy.
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
     activeYearId = academicYearRepository.getActive()?.id ?? ''
     entrySnapshotSql =
-      'SELECT id, academic_year_id, day_of_week, time_slot_id, section_id, subject_id, faculty_id, room_id, class_type FROM timetable_entries ORDER BY id'
+      `SELECT te.id, te.academic_year_id, te.day_of_week, te.time_slot_id, te.section_id,
+              te.subject_id, te.class_type, te.span,
+              (SELECT GROUP_CONCAT(faculty_id) FROM (
+                 SELECT faculty_id FROM timetable_entry_faculty
+                 WHERE entry_id = te.id ORDER BY position)) AS faculty_ids,
+              (SELECT GROUP_CONCAT(room_id) FROM (
+                 SELECT room_id FROM timetable_entry_rooms
+                 WHERE entry_id = te.id ORDER BY position)) AS room_ids
+       FROM timetable_entries te ORDER BY te.id`
   })
 
   afterAll(() => {
@@ -177,17 +191,21 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
     // Find the first genuinely free day/period for this section+faculty+room.
     const free = days
       .flatMap(day => slots.map(slot => ({ day, slot })))
-      .find(({ day, slot }) =>
-        timetableEntryRepository.checkConflicts({
-          academicYearId: activeYearId,
-          dayOfWeek: day,
-          timeSlotId: slot.id,
-          sectionId: section.id,
-          subjectId: subject.id,
-          facultyId: faculty.id,
-          roomId: room.id,
-          classType: 'LECTURE',
-        }).length === 0
+      .find(
+        ({ day, slot }) =>
+          detectConflicts(
+            {
+              dayOfWeek: day,
+              timeSlotId: slot.id,
+              sectionId: section.id,
+              subjectId: subject.id,
+              facultyIds: [faculty.id],
+              roomIds: [room.id],
+              classType: 'LECTURE',
+              span: 1,
+            },
+            activeYearId
+          ).length === 0
       )
     expect(free).toBeTruthy()
 
@@ -196,9 +214,10 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
       timeSlotId: free!.slot.id,
       sectionId: section.id,
       subjectId: subject.id,
-      facultyId: faculty.id,
-      roomId: room.id,
+      facultyIds: [faculty.id],
+      roomIds: [room.id],
       classType: 'LECTURE' as const,
+      span: 1,
     }
 
     // 1. Create (the historical bug: academic_year_id was never set by the UI).
@@ -207,11 +226,19 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
       .prepare('SELECT academic_year_id FROM timetable_entries WHERE id = ?')
       .get(created.id) as any
     expect(row.academic_year_id).toBe(activeYearId)
+    // Faculty/rooms are persisted in the ordered join tables (position 0 = lead).
+    expect(
+      (
+        testDb!
+          .prepare('SELECT faculty_id FROM timetable_entry_faculty WHERE entry_id = ? AND position = 0')
+          .get(created.id) as any
+      )?.faculty_id
+    ).toBe(faculty.id)
 
     // 2. Double-booking is refused with readable text.
     expect(() =>
       createTimetableEntry({ ...payload, sectionId: sectionRepository.findAll().at(-1)!.id }, activeYearId)
-    ).toThrow(/already has a class at this time|already booked/i)
+    ).toThrow(/already teaching|already has|already booked/i)
 
     // 3. Break periods can never receive entries.
     const breakSlot = timeSlotRepository.getBreakSlots()[0]
@@ -241,7 +268,12 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
     }
 
     const beforeEntries = JSON.stringify(testDb!.prepare(entrySnapshotSql).all())
-    const absentFacultyId = wedEntries[0].facultyId
+    const absentFacultyId =
+      wedEntries.find(e => e.facultyIds.length > 0)?.facultyIds[0]
+    if (!absentFacultyId) {
+      console.log('  [live] Wednesday entries have no faculty — engine workflow skipped')
+      return
+    }
     attendanceRepository.upsert(WEDNESDAY, absentFacultyId, 'ABSENT', 'Live audit check')
 
     const result = generateSubstitutions(WEDNESDAY)
@@ -268,7 +300,7 @@ describe.skipIf(!HAS_PROD_DB)('live workflow on a copy of the production databas
       // …and no substitute is simultaneously teaching their own class.
       const ownClassSamePeriod = allEntries.some(
         e =>
-          e.facultyId === a.substituteFacultyId &&
+          e.facultyIds.includes(a.substituteFacultyId!) &&
           e.dayOfWeek === covered.dayOfWeek &&
           e.timeSlotId === covered.timeSlotId
       )

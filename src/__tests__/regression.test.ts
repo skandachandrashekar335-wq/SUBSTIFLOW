@@ -116,9 +116,10 @@ function baseEntry(overrides: Record<string, unknown> = {}) {
     timeSlotId: 'slot-4',
     sectionId: 'sec-1',
     subjectId: 'sub-1',
-    facultyId: 'fac-1',
-    roomId: 'room-1',
+    facultyIds: ['fac-1'],
+    roomIds: ['room-1'],
     classType: 'LECTURE',
+    span: 1,
     ...overrides,
   } as Parameters<typeof createTimetableEntry>[0]
 }
@@ -165,7 +166,7 @@ describe('regression: timetable entry creation', () => {
     let message = ''
     try {
       createTimetableEntry(
-        baseEntry({ timeSlotId: '', sectionId: '', facultyId: '' }) as any,
+        baseEntry({ timeSlotId: '', sectionId: '', facultyIds: [] }) as any,
         'year-1'
       )
     } catch (e: any) {
@@ -179,14 +180,17 @@ describe('regression: timetable entry creation', () => {
   it('surfaces conflicts as coordinator-readable messages, not SQL', () => {
     createTimetableEntry(baseEntry(), 'year-1')
     let message = ''
+    let thrown: any = null
     try {
-      // Same faculty + day + slot, different section → faculty clash.
+      // Same faculty + day + slot, different section → faculty + room clash.
       createTimetableEntry(baseEntry({ sectionId: 'sec-2' }), 'year-1')
     } catch (e: any) {
       message = e.message
+      thrown = e
     }
-    expect(message).toContain('Faculty already has a class at this time')
-    expect(message).toContain('Room already booked at this time') // same room reused
+    expect(thrown?.name).toBe('TimetableConflictError') // structured, dialog-ready
+    expect(message).toContain('is already teaching III BCA-B from')
+    expect(message).toContain('already booked by') // same room reused
     expect(message).not.toMatch(/SQLITE|constraint/i)
     expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(1)
   })
@@ -574,8 +578,10 @@ describe('QA-012: add entry form state matches the displayed selects', () => {
         dayOfWeek: 'WEDNESDAY',
         ...defaults,
         subjectId: 'sub-1',
-        facultyId: 'fac-1',
+        facultyIds: ['fac-1'],
+        roomIds: defaults.roomId ? [defaults.roomId] : [],
         classType: 'LECTURE',
+        span: 1,
       } as Parameters<typeof createTimetableEntry>[0],
       'year-1'
     )
@@ -585,15 +591,19 @@ describe('QA-012: add entry form state matches the displayed selects', () => {
     expect(saved).toBeTruthy()
     expect(saved!.timeSlotId).toBe(defaults.timeSlotId)
     expect(saved!.sectionId).toBe(defaults.sectionId)
-    expect(saved!.roomId).toBe(defaults.roomId)
+    expect(saved!.roomIds).toEqual([defaults.roomId])
 
-    // Source of truth: read the persisted row straight from SQLite.
+    // Source of truth: read the persisted row + joins straight from SQLite.
     const row = testDb!
-      .prepare('SELECT time_slot_id, section_id, room_id FROM timetable_entries WHERE id = ?')
-      .get(created.id) as { time_slot_id: string; section_id: string; room_id: string }
+      .prepare('SELECT time_slot_id, section_id FROM timetable_entries WHERE id = ?')
+      .get(created.id) as { time_slot_id: string; section_id: string }
     expect(row.time_slot_id).toBe(defaults.timeSlotId)
     expect(row.section_id).toBe(defaults.sectionId)
-    expect(row.room_id).toBe(defaults.roomId)
+    const roomRow = testDb!
+      .prepare('SELECT room_id, position FROM timetable_entry_rooms WHERE entry_id = ?')
+      .get(created.id) as { room_id: string; position: number }
+    expect(roomRow.room_id).toBe(defaults.roomId)
+    expect(roomRow.position).toBe(0)
   })
 
   it('validation still rejects a genuinely empty state with the exact QA-012 messages (not weakened)', () => {
@@ -605,10 +615,11 @@ describe('QA-012: add entry form state matches the displayed selects', () => {
           ...defaultsFor(),
           timeSlotId: '',
           sectionId: '',
-          roomId: '',
+          facultyIds: [],
+          roomIds: [],
           subjectId: 'sub-1',
-          facultyId: 'fac-1',
           classType: 'LECTURE',
+          span: 1,
         } as Parameters<typeof createTimetableEntry>[0],
         'year-1'
       )
@@ -617,7 +628,10 @@ describe('QA-012: add entry form state matches the displayed selects', () => {
     }
     expect(message).toMatch(/Time period is required/)
     expect(message).toMatch(/Section is required/)
-    expect(message).toMatch(/Room is required/)
+    expect(message).toMatch(/Faculty is required/) // still hard for LECTURE
+    // Room is intentionally NOT required — "Not specified" is a valid state
+    // (we never force fabricated rooms onto official activities).
+    expect(message).not.toMatch(/Room is required/)
     expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(0)
   })
 
@@ -641,11 +655,11 @@ function seedSubstitutionScenario(): void {
   facultyRepository.setSubjects('fac-3', [{ facultyId: 'fac-3', subjectId: 'sub-1', proficiency: 4 }])
   timetableEntryRepository.create({
     id: 'tt-sub-1', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-4',
-    sectionId: 'sec-1', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-1', classType: 'LECTURE',
+    sectionId: 'sec-1', subjectId: 'sub-1', facultyIds: ['fac-1'], roomIds: ['room-1'], classType: 'LECTURE', span: 1,
   })
   timetableEntryRepository.create({
     id: 'tt-sub-2', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-5',
-    sectionId: 'sec-2', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-2', classType: 'LECTURE',
+    sectionId: 'sec-2', subjectId: 'sub-1', facultyIds: ['fac-1'], roomIds: ['room-2'], classType: 'LECTURE', span: 1,
   })
   attendanceRepository.upsert(SUB_DATE, 'fac-1', 'ABSENT')
 }
@@ -847,7 +861,7 @@ describe('hard constraint: periods outside working hours', () => {
     })
     timetableEntryRepository.create({
       id: 'tt-early', academicYearId: 'year-1', dayOfWeek: 'WEDNESDAY', timeSlotId: early.id,
-      sectionId: 'sec-1', subjectId: 'sub-1', facultyId: 'fac-1', roomId: 'room-1', classType: 'LECTURE',
+      sectionId: 'sec-1', subjectId: 'sub-1', facultyIds: ['fac-1'], roomIds: ['room-1'], classType: 'LECTURE', span: 1,
     })
 
     const result = generateSubstitutions(SUB_DATE)

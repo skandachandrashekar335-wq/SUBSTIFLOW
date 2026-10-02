@@ -149,9 +149,9 @@ describe('quick entry: cell context', () => {
     const input = buildQuickEntryInput({
       context: action.context,
       sectionId: action.context.sectionId!,
-      facultyId: 'fac-usha',
+      facultyIds: ['fac-usha'],
       subjectId: 'sub-english',
-      roomId,
+      roomIds: [roomId],
     })
     expect(validateTimetableEntryInput(input)).toEqual([])
     const created = createTimetableEntry(input, 'year-1')
@@ -182,9 +182,9 @@ describe('quick entry: cell context', () => {
       buildQuickEntryInput({
         context: { dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-1', sectionId: 'sec-3b' },
         sectionId: 'sec-3b',
-        facultyId: 'fac-usha',
+        facultyIds: ['fac-usha'],
         subjectId: 'sub-english',
-        roomId: 'room-208',
+        roomIds: ['room-208'],
       }),
       'year-1'
     )
@@ -230,9 +230,10 @@ describe('faculty ↔ subject dropdown filtering', () => {
       timeSlotId: 'slot-1',
       sectionId: 'sec-3b',
       subjectId: 'sub-english',
-      facultyId: 'fac-unmapped',
-      roomId: 'room-208',
+      facultyIds: ['fac-unmapped'],
+      roomIds: ['room-208'],
       classType: 'LECTURE' as const,
+      span: 1,
     }
     // Create path rejects it...
     expect(() => createTimetableEntry(base, 'year-1')).toThrow(/not assigned|no subjects assigned/i)
@@ -251,7 +252,7 @@ describe('faculty ↔ subject dropdown filtering', () => {
     expect(reconcileSubjectChange('fac-usha', 'sub-english')).toEqual({ facultyId: 'fac-usha', cleared: false })
 
     // The corrected pairing saves.
-    expect(() => createTimetableEntry({ ...base, facultyId: 'fac-keerthi' }, 'year-1')).not.toThrow()
+    expect(() => createTimetableEntry({ ...base, facultyIds: ['fac-keerthi'] }, 'year-1')).not.toThrow()
   })
 })
 
@@ -264,10 +265,11 @@ describe('full Add Entry form', () => {
       dayOfWeek: 'THURSDAY' as const,
       timeSlotId: 'slot-2',
       sectionId: 'sec-3a',
-      facultyId: 'fac-keerthi',
+      facultyIds: ['fac-keerthi'],
       subjectId: 'sub-ai',
-      roomId: 'room-209',
+      roomIds: ['room-209'],
       classType: 'LAB' as const,
+      span: 1,
     }
     expect(validateTimetableEntryInput(payload)).toEqual([])
     const created = createTimetableEntry(payload, 'year-1')
@@ -275,10 +277,19 @@ describe('full Add Entry form', () => {
     expect(row.day_of_week).toBe('THURSDAY')
     expect(row.time_slot_id).toBe('slot-2')
     expect(row.section_id).toBe('sec-3a')
-    expect(row.faculty_id).toBe('fac-keerthi')
     expect(row.subject_id).toBe('sub-ai')
-    expect(row.room_id).toBe('room-209')
     expect(row.class_type).toBe('LAB')
     expect(row.academic_year_id).toBe('year-1')
+    // Faculty and rooms live in the ordered join tables (position 0 = lead).
+    const facultyRow = testDb!
+      .prepare('SELECT faculty_id, position FROM timetable_entry_faculty WHERE entry_id = ?')
+      .get(created.id) as any
+    expect(facultyRow.faculty_id).toBe('fac-keerthi')
+    expect(facultyRow.position).toBe(0)
+    const roomRow = testDb!
+      .prepare('SELECT room_id, position FROM timetable_entry_rooms WHERE entry_id = ?')
+      .get(created.id) as any
+    expect(roomRow.room_id).toBe('room-209')
+    expect(roomRow.position).toBe(0)
   })
 })

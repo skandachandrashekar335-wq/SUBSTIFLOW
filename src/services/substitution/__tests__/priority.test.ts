@@ -110,9 +110,10 @@ function setupTestDb(): void {
     timeSlotId: 'slot-1',
     sectionId: 'sec-3b',
     subjectId: 'sub-english',
-    facultyId: 'fac-absent',
-    roomId: 'room-1',
+    facultyIds: ['fac-absent'],
+    roomIds: ['room-1'],
     classType: 'LECTURE',
+    span: 1,
   })
 }
 

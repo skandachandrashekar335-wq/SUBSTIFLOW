@@ -94,22 +94,22 @@ function setup(): void {
   // Two absent teachers both lose a slot-4 class ...
   timetableEntryRepository.create({
     id: 'tt-absent-a', academicYearId: YEAR, dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-4',
-    sectionId: 'sec-a', subjectId: 'sub-math', facultyId: 'fac-absent', roomId: 'room-1', classType: 'LECTURE',
+    sectionId: 'sec-a', subjectId: 'sub-math', facultyIds: ['fac-absent'], roomIds: ['room-1'], classType: 'LECTURE', span: 1,
   })
   timetableEntryRepository.create({
     id: 'tt-absent-c', academicYearId: YEAR, dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-4',
-    sectionId: 'sec-c', subjectId: 'sub-eng', facultyId: 'fac-absent2', roomId: 'room-2', classType: 'LECTURE',
+    sectionId: 'sec-c', subjectId: 'sub-eng', facultyIds: ['fac-absent2'], roomIds: ['room-2'], classType: 'LECTURE', span: 1,
   })
   // ... and fac-busy is teaching sec-b in that same slot.
   timetableEntryRepository.create({
     id: 'tt-busy', academicYearId: YEAR, dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-4',
-    sectionId: 'sec-b', subjectId: 'sub-eng', facultyId: 'fac-busy', roomId: 'room-3', classType: 'LECTURE',
+    sectionId: 'sec-b', subjectId: 'sub-eng', facultyIds: ['fac-busy'], roomIds: ['room-3'], classType: 'LECTURE', span: 1,
   })
   // A class in a *different* slot, so the daily limit can be exercised without
   // a same-slot conflict getting in the way.
   timetableEntryRepository.create({
     id: 'tt-extra', academicYearId: YEAR, dayOfWeek: 'WEDNESDAY', timeSlotId: 'slot-2',
-    sectionId: 'sec-a', subjectId: 'sub-eng', facultyId: 'fac-absent2', roomId: 'room-1', classType: 'LECTURE',
+    sectionId: 'sec-a', subjectId: 'sub-eng', facultyIds: ['fac-absent2'], roomIds: ['room-1'], classType: 'LECTURE', span: 1,
   })
 
   attendanceRepository.upsert(DATE, 'fac-absent', 'ABSENT')

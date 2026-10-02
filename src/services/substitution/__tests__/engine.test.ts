@@ -200,9 +200,10 @@ function seedTestData(): void {
       timeSlotId: slotId,
       sectionId,
       subjectId,
-      facultyId,
-      roomId,
+      facultyIds: [facultyId],
+      roomIds: [roomId],
       classType: 'LECTURE',
+      span: 1,
     })
   }
 }
@@ -216,7 +217,7 @@ function markAbsent(facultyIds: string[]): void {
 /** All Wednesday entries taught by the given faculty, limited to a slot. */
 function entriesFor(facultyId: string, timeSlotId?: string): TimetableEntryWithRelations[] {
   const all = timetableEntryRepository.getWithRelations(YEAR).filter(
-    (e) => e.facultyId === facultyId && e.dayOfWeek === 'WEDNESDAY'
+    (e) => e.facultyIds.includes(facultyId) && e.dayOfWeek === 'WEDNESDAY'
   )
   return timeSlotId ? all.filter((e) => e.timeSlotId === timeSlotId) : all
 }
