@@ -2,7 +2,26 @@
 
 export type DayOfWeek = 'MONDAY' | 'TUESDAY' | 'WEDNESDAY' | 'THURSDAY' | 'FRIDAY' | 'SATURDAY'
 
-export type ClassType = 'LECTURE' | 'LAB' | 'TUTORIAL' | 'OTHER'
+export type ClassType =
+  | 'LECTURE'
+  | 'LAB'
+  | 'TUTORIAL'
+  | 'LIBRARY'
+  | 'MENTORING'
+  | 'SKILL_BUILD'
+  | 'COE'
+  | 'OTHER'
+
+/**
+ * Activity types that are teaching activities: at least one faculty member
+ * must be attached to the entry. Types NOT in this list (library, mentoring,
+ * skill build, COE, tutorial, other) may legitimately have no faculty —
+ * validation is tightened per type, never weakened globally.
+ */
+export const FACULTY_REQUIRED_CLASS_TYPES: readonly ClassType[] = ['LECTURE', 'LAB']
+
+/** Configurable policy for partially-absent multi-faculty activities. */
+export type MultiFacultyAbsencePolicy = 'TEAM_SUFFICIENT' | 'REPLACE_ABSENT'
 
 export type AttendanceStatus = 'PRESENT' | 'ABSENT'
 
@@ -97,9 +116,13 @@ export interface TimetableEntry {
   timeSlotId: string
   sectionId: string
   subjectId: string
-  facultyId: string
-  roomId: string
+  /** 0 = faculty-less activity; 1..N = teaching team (ordered, no duplicates). */
+  facultyIds: string[]
+  /** 0 = "Not specified"; 1..N rooms (ordered, position 0 = primary). */
+  roomIds: string[]
   classType: ClassType
+  /** Number of consecutive periods the activity occupies (1 = one period). */
+  span: number
   createdAt: string
   updatedAt: string
 }
@@ -170,8 +193,36 @@ export interface TimetableEntryWithRelations extends TimetableEntry {
   timeSlot?: TimeSlot
   section?: Section
   subject?: Subject
+  /** Lead faculty (first team member) — null for faculty-less activities. */
   faculty?: Faculty
+  /** Primary room (first) — undefined when no room is specified. */
   room?: Room
+  /** Full teaching team in order (may be empty for faculty-less activities). */
+  facultyList?: Faculty[]
+  /** All rooms in order (may be empty). */
+  roomList?: Room[]
+}
+
+/** A term / timetable validity window inside an academic year. */
+export interface Term {
+  id: string
+  academicYearId: string
+  name: string
+  startDate: string // YYYY-MM-DD
+  endDate: string // YYYY-MM-DD
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+/** One audit-trail record (who/what/when) for important actions. */
+export interface AuditLogEntry {
+  id: string
+  action: string
+  entityType: string
+  entityId?: string
+  detail?: string
+  createdAt: string
 }
 
 export interface SubstitutionAssignmentWithRelations extends SubstitutionAssignment {
@@ -255,5 +306,14 @@ export const CLASS_TYPES: { value: ClassType; label: string }[] = [
   { value: 'LECTURE', label: 'Lecture' },
   { value: 'LAB', label: 'Lab' },
   { value: 'TUTORIAL', label: 'Tutorial' },
+  { value: 'LIBRARY', label: 'Library' },
+  { value: 'MENTORING', label: 'Mentoring' },
+  { value: 'SKILL_BUILD', label: 'Skill Build' },
+  { value: 'COE', label: 'COE' },
   { value: 'OTHER', label: 'Other' },
 ]
+
+/** Human label for an activity type (falls back to the raw value). */
+export function classTypeLabel(value: string): string {
+  return CLASS_TYPES.find((t) => t.value === value)?.label ?? value
+}

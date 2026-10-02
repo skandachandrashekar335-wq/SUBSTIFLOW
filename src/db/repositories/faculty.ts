@@ -136,15 +136,18 @@ export class FacultyRepository extends BaseRepository<Faculty> {
    *
    * Timetable usage is checked first so the coordinator gets a friendly,
    * countable message instead of a raw FOREIGN KEY failure (schema:
-   * `timetable_entries.faculty_id` is ON DELETE RESTRICT). Subject/section
-   * mappings and attendance rows cascade away; substitution history is kept
-   * with the substitute set to NULL.
+   * `timetable_entry_faculty.faculty_id` is ON DELETE RESTRICT — membership in
+   * a teaching team also counts as scheduling). Subject/section mappings and
+   * attendance rows cascade away; substitution history is kept with the
+   * substitute set to NULL.
    */
   delete(id: string): boolean {
     const existing = this.findById(id)
     if (!existing) return false
     const usage = this.db()
-      .prepare('SELECT COUNT(*) as count FROM timetable_entries WHERE faculty_id = ?')
+      .prepare(
+        'SELECT COUNT(*) as count FROM timetable_entry_faculty WHERE faculty_id = ?'
+      )
       .get(id) as { count: number }
     if (usage.count > 0) {
       const n = usage.count

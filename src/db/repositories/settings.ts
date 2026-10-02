@@ -1,5 +1,5 @@
 import { BaseRepository } from './base'
-import { ApplicationSettings, DAYS_OF_WEEK, DayOfWeek } from '@/types'
+import { ApplicationSettings, DAYS_OF_WEEK, DayOfWeek, MultiFacultyAbsencePolicy } from '@/types'
 
 export class SettingsRepository extends BaseRepository<ApplicationSettings> {
   protected tableName = 'application_settings'
@@ -111,6 +111,27 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
 
   setMaxDailySubstitutions(value: number): void {
     this.set('max_daily_substitutions', value.toString(), 'Maximum daily substitutions per faculty')
+  }
+
+  /**
+   * What happens when SOME (but not all) faculty of a multi-faculty activity
+   * are absent:
+   *  - TEAM_SUFFICIENT (default): the remaining team continues — no
+   *    substitution is generated for the activity.
+   *  - REPLACE_ABSENT: a substitution is generated for the absent member(s).
+   * An entry where ALL faculty are absent is always affected, regardless.
+   */
+  getMultiFacultyAbsencePolicy(): MultiFacultyAbsencePolicy {
+    const raw = this.get('multi_faculty_absence_policy')
+    return raw === 'REPLACE_ABSENT' ? 'REPLACE_ABSENT' : 'TEAM_SUFFICIENT'
+  }
+
+  setMultiFacultyAbsencePolicy(policy: MultiFacultyAbsencePolicy): void {
+    this.set(
+      'multi_faculty_absence_policy',
+      policy,
+      'Multi-faculty absence policy: TEAM_SUFFICIENT or REPLACE_ABSENT'
+    )
   }
 
   getSubstitutionWeights(): Record<string, number> {

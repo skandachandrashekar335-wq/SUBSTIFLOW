@@ -5,7 +5,7 @@ export interface BaseEntity {
 }
 
 /** camelCase -> snake_case column name conversion */
-function toColumn(key: string): string {
+export function toColumn(key: string): string {
   if (key === 'order') return '"order"'
   if (key === 'key') return '"key"'
   return key.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase())
