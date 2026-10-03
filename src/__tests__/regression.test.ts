@@ -1060,3 +1060,37 @@ describe('QA-026: getRevisedTimetable returns a truthful revised day view', () =
     expect(revised.some(r => r.isSubstituted)).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// 30. Locked means locked — even when the disabled control is bypassed
+//     (found by acceptance test 39R.P10.3b: the service accepted a substitute
+//     change on a LOCKED row and silently reopened the approved run)
+// ---------------------------------------------------------------------------
+describe('locked assignment refuses substitute changes at the service layer', () => {
+  it('throws with a locked message, leaves substitute + lock intact, and only unlocks through status', () => {
+    seedSubstitutionScenario()
+    const result = generateSubstitutions(SUB_DATE)
+    const covered = result.assignments.find(a => a.substituteFacultyId)!
+    const substitute = covered.substituteFacultyId
+
+    expect(updateSubstitutionAssignment(covered.id, { status: 'LOCKED' })).toBeTruthy()
+
+    // The guard must fire BEFORE constraint validation — an arbitrary id is
+    // rejected for being locked, not for being invalid.
+    expect(() => updateSubstitutionAssignment(covered.id, { substituteFacultyId: 'fac-bypassed' }))
+      .toThrow(/locked/i)
+
+    let row = assignmentRow(covered.id)
+    expect(row.substitute_faculty_id).toBe(substitute)
+    expect(row.is_locked).toBe(1)
+    expect(row.status).toBe('LOCKED')
+
+    // The guard is narrow: unlocking via status still works, and once
+    // unlocked a substitute change is accepted again.
+    expect(updateSubstitutionAssignment(covered.id, { status: 'PENDING' })).toBeTruthy()
+    row = assignmentRow(covered.id)
+    expect(row.is_locked).toBe(0)
+    expect(updateSubstitutionAssignment(covered.id, { substituteFacultyId: null })).toBeTruthy()
+    expect(assignmentRow(covered.id).substitute_faculty_id).toBeFalsy()
+  })
+})

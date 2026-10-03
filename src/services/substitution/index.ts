@@ -369,6 +369,22 @@ export function updateSubstitutionAssignment(
     score?: number | null
   }
 ): any {
+  const current = substitutionAssignmentRepository.findById(assignmentId)
+
+  // Locked means locked. The planner disables the substitute control on a
+  // locked row; this guard refuses the same change at the service layer too,
+  // so the rule survives a bypassed control (acceptance test 39R.P10.3b).
+  // Deliberately narrow: only substitute-changing updates are blocked —
+  // locking/unlocking (status/isLocked) must keep working.
+  if (
+    'substituteFacultyId' in updates &&
+    current &&
+    (current.isLocked || current.status === 'LOCKED') &&
+    (updates.substituteFacultyId ?? null) !== (current.substituteFacultyId ?? null)
+  ) {
+    throw new Error('This substitution is locked. Unlock it before changing the substitute.')
+  }
+
   // A substitute chosen by hand must clear the same hard constraints as the
   // generated plan; `null` means the change was rejected.
   if (updates.substituteFacultyId) {

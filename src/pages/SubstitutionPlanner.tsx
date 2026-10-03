@@ -130,9 +130,16 @@ export function SubstitutionPlanner() {
       }
     }
 
-    const updated = updateSubstitutionAssignment(assignmentId, { substituteFacultyId: facultyId })
-    if (facultyId && !updated) {
-      alert('The assignment could not be changed. The substitute may be absent, busy or at the daily limit.')
+    try {
+      const updated = updateSubstitutionAssignment(assignmentId, { substituteFacultyId: facultyId })
+      if (facultyId && !updated) {
+        alert('The assignment could not be changed. The substitute may be absent, busy or at the daily limit.')
+        return
+      }
+    } catch (error) {
+      // e.g. "This substitution is locked…" — surfaced verbatim so the
+      // coordinator learns exactly why nothing changed.
+      alert(error instanceof Error ? error.message : 'Could not change this assignment. Please try again.')
       return
     }
 
