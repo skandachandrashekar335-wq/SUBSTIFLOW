@@ -22,8 +22,23 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
   set(key: string, value: string, description?: string): ApplicationSettings {
     const existing = this.db()
       .prepare('SELECT id, description FROM application_settings WHERE key = ?')
-      .get(key) as { id: string; description: string | null } | undefined
+      .get(key) as { id: string | null; description: string | null } | undefined
     if (existing) {
+      // A v2 migration inserted one settings row without an id (SQLite permits
+      // NULL in a TEXT PRIMARY KEY). BaseRepository.update targets `WHERE id = ?`,
+      // which never matches NULL — the UPDATE affected 0 rows and the save
+      // silently vanished while the UI still showed "Saved!". Stamp a real id
+      // first so the update lands, then proceed normally.
+      if (existing.id === null || existing.id === undefined) {
+        const repairedId = crypto.randomUUID()
+        this.db()
+          .prepare('UPDATE application_settings SET id = ? WHERE key = ? AND id IS NULL')
+          .run(repairedId, key)
+        return this.update(repairedId, {
+          value,
+          description: description !== undefined ? description : existing.description ?? undefined,
+        })!
+      }
       // A plain set(key, value) must not wipe the row's description
       // (the base update writes undefined/omitted columns as NULL).
       return this.update(existing.id, {

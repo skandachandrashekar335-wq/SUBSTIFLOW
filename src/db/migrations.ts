@@ -243,9 +243,12 @@ function migrateV2MultiFacultySpanAndDates(db: SqlDatabase): void {
       ).run()
 
       // --- 5. Configurable multi-faculty absence policy -------------------
+      // id is required: a NULL id would make every later update (which targets
+      // `WHERE id = ?`) silently match no rows, so the setting could never
+      // be changed from the Settings screen.
       db.prepare(
-        `INSERT INTO application_settings (key, value, description)
-         SELECT 'multi_faculty_absence_policy', 'TEAM_SUFFICIENT',
+        `INSERT INTO application_settings (id, key, value, description)
+         SELECT 'setting-multi-faculty-absence-policy', 'multi_faculty_absence_policy', 'TEAM_SUFFICIENT',
                 'What to do when some (not all) faculty of a multi-faculty activity are absent: TEAM_SUFFICIENT keeps the class running with the remaining team; REPLACE_ABSENT generates a substitution for the absent member(s).'
          WHERE NOT EXISTS (SELECT 1 FROM application_settings WHERE key = 'multi_faculty_absence_policy')`
       ).run()

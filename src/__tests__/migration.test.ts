@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { runMigrations, TARGET_SCHEMA_VERSION } from '@/db/migrations'
 import { timetableEntryRepository } from '@/db/repositories/timetableEntry'
+import { settingsRepository } from '@/db/repositories/settings'
 
 let testDb: Database.Database | null = null
 
@@ -91,7 +92,11 @@ CREATE TABLE timetable_entries (
 );
 CREATE INDEX idx_timetable_entries_academic_year ON timetable_entries(academic_year_id);
 CREATE TABLE application_settings (
-  key TEXT PRIMARY KEY, value TEXT NOT NULL, description TEXT,
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  value TEXT NOT NULL,
+  description TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `
@@ -229,9 +234,12 @@ describe('migration v1 → current', () => {
     expect(term.is_active).toBe(1)
 
     const policy = testDb!
-      .prepare("SELECT value FROM application_settings WHERE key = 'multi_faculty_absence_policy'")
-      .get() as { value: string }
+      .prepare("SELECT id, value FROM application_settings WHERE key = 'multi_faculty_absence_policy'")
+      .get() as { id: string | null; value: string }
     expect(policy.value).toBe('TEAM_SUFFICIENT')
+    // The seeded row MUST carry an id: a NULL id made every later update
+    // (`WHERE id = ?`) match no rows, so the setting could never be changed.
+    expect(policy.id).toBeTruthy()
 
     // Existing settings survive.
     const institution = testDb!
@@ -246,6 +254,20 @@ describe('migration v1 → current', () => {
     // Referential integrity verified after the rebuild.
     expect(testDb!.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0)
     expect(testDb!.prepare('PRAGMA foreign_keys').get()).toMatchObject({ foreign_keys: 1 })
+  })
+
+  it('repairs a legacy NULL-id settings row so saves are not silently lost', () => {
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+    // Reproduce the pre-fix migration row: present but with a NULL id.
+    testDb!.prepare("UPDATE application_settings SET id = NULL WHERE key = 'multi_faculty_absence_policy'").run()
+
+    settingsRepository.setMultiFacultyAbsencePolicy('REPLACE_ABSENT')
+
+    const row = testDb!
+      .prepare("SELECT id, value FROM application_settings WHERE key = 'multi_faculty_absence_policy'")
+      .get() as { id: string | null; value: string }
+    expect(row.value).toBe('REPLACE_ABSENT') // persisted — the old code dropped this write
+    expect(row.id).toBeTruthy() // id stamped so every future save lands too
   })
 
   it('is idempotent — a second launch applies nothing', () => {
