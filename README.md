@@ -4,7 +4,7 @@ Offline-first college timetable and faculty-substitution management system for c
 
 ## Overview
 
-Every working day a college coordinator faces the same chain of problems: a faculty member is absent, certain classes are affected, someone has to cover them, and the day's timetable has to be reissued — correctly, explainably, and before the next period starts.
+Every working day, a college coordinator faces the same chain of problems: a faculty member is absent, certain classes are affected, someone has to cover them, and the day's timetable has to be reissued — correctly, explainably, and before the next period starts.
 
 SubstiFlow manages that workflow end to end:
 
