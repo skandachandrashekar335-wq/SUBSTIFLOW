@@ -105,9 +105,23 @@ if (target === 'win32') {
     '  cd node_modules/better-sqlite3 && npx prebuild-install ' +
     '--runtime=electron --target=<electron version> --arch=x64 --platform=win32'
 } else if (target === 'node') {
-  // `npm rebuild` runs the package's own install script, which prefers the
-  // published host prebuild and only compiles as a fallback.
-  ok = run('npm', ['rebuild', 'better-sqlite3']).status === 0
+  // Prefer the published host prebuild so Windows CI does not need a native
+  // compiler just to switch back from Electron's ABI for Vitest. Compile only
+  // as a fallback. When called from an npm script, use npm's own execpath so a
+  // local `.bin/npm` shim cannot shadow the Node-distributed npm installation.
+  const prebuild = path.join(root, 'node_modules', '.bin', 'prebuild-install')
+  const prebuildResult = run(
+    prebuild,
+    ['--runtime=node', `--arch=${process.arch}`, `--platform=${process.platform}`],
+    { cwd: nativeModuleDir },
+  )
+  ok = prebuildResult.status === 0 && binaryMatchesPlatform(stampPlatform(wanted))
+  if (!ok) {
+    const npmExecPath = process.env.npm_execpath
+    ok = npmExecPath
+      ? run(process.execPath, [npmExecPath, 'rebuild', 'better-sqlite3']).status === 0
+      : run('npm', ['rebuild', 'better-sqlite3']).status === 0
+  }
   hint = '  npm rebuild better-sqlite3'
 } else {
   // Prefer the published Electron prebuild. This avoids requiring a native
