@@ -46,7 +46,10 @@ export abstract class BaseRepository<T extends BaseEntity> {
 
   findAll(): T[] {
     const rows = this.db()
-      .prepare(`SELECT * FROM ${this.tableName} ORDER BY created_at DESC`)
+      // created_at is timestamped with millisecond precision, so several
+      // seeded or fast-created rows can legitimately tie. Add the stable id
+      // tie-breaker so callers do not observe platform-dependent row order.
+      .prepare(`SELECT * FROM ${this.tableName} ORDER BY created_at DESC, id ASC`)
       .all() as any[]
     return rows.map((row) => this.entityFromRow(row))
   }
