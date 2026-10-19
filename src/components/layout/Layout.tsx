@@ -1,6 +1,7 @@
 import { Outlet } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { Header } from './Header'
+import { DemoBanner } from './DemoBanner'
 import { cn } from '@/utils/cn'
 import { useAppStore } from '@/stores/appStore'
 
@@ -16,6 +17,7 @@ export function Layout() {
         sidebarOpen ? 'lg:pl-64' : 'lg:pl-20'
       )}>
         <div className="p-6">
+          <DemoBanner />
           <Outlet />
         </div>
       </main>

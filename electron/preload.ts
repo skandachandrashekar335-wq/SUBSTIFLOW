@@ -12,11 +12,10 @@ contextBridge.exposeInMainWorld('electron', {
     getSync: (sql: string, params: unknown[]): IpcResult => sync('db:get', { sql, params }),
     runSync: (sql: string, params: unknown[]): IpcResult => sync('db:run', { sql, params }),
     execSync: (sql: string): IpcResult => sync('db:exec', { sql }),
-
-    query: (sql: string, params?: unknown[]): Promise<IpcResult> =>
-      ipcRenderer.invoke('db:query', sql, params),
-    transaction: (sqls: { sql: string; params: unknown[] }[]): Promise<IpcResult> =>
-      ipcRenderer.invoke('db:transaction', sqls),
+    // NOTE: `db:query` / `db:transaction` (async invoke) were removed from
+    // both sides of the bridge: nothing in the renderer ever called them, and
+    // their raw BEGIN/COMMIT had no nesting guard against an in-flight
+    // `withTransaction` on the same connection.
   },
   backup: {
     exportBackup: (): Promise<{ success: boolean; path?: string; error?: string }> =>
@@ -38,6 +37,7 @@ contextBridge.exposeInMainWorld('electron', {
       userDataPath: string
       dbPath: string
       isDev: boolean
+      isDemo: boolean
     }> => ipcRenderer.invoke('app:info'),
   },
   print: {

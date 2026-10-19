@@ -93,6 +93,20 @@ export function SubstitutionPlanner() {
 
   const handleApprove = async () => {
     if (!runData) return
+    // Product decision: approving with uncovered classes is ALLOWED — the
+    // coordinator may have arranged those covers outside the app — but never
+    // silently. Previously the approve button was simply hidden whenever
+    // anything was uncovered, leaving no way forward at all.
+    const uncovered = runData.statistics.uncovered
+    if (
+      uncovered > 0 &&
+      !confirm(
+        `${uncovered} ${uncovered === 1 ? 'class is' : 'classes are'} still uncovered. ` +
+          'These classes will run with no substitute assigned in SubstiFlow. Approve anyway?'
+      )
+    ) {
+      return
+    }
     setApproving(true)
     try {
       const approved = approveSubstitutionRun(today, 'Coordinator')
@@ -357,7 +371,7 @@ export function SubstitutionPlanner() {
                   (a: any) => a.originalEntryId === uncovered.originalEntryId
                 )
                 return (
-                  <div key={index} className="p-4 bg-white border border-danger-200 rounded-lg">
+                  <div key={uncovered.originalEntryId || `uncovered-${index}`} className="p-4 bg-white border border-danger-200 rounded-lg">
                     <div className="flex items-start justify-between gap-4">
                       <div className="flex-1">
                         <p className="font-medium text-secondary-900">
@@ -395,15 +409,15 @@ export function SubstitutionPlanner() {
           <CardHeader>
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-semibold text-secondary-900">Generated Substitutions ({runData.assignments.length})</h3>
-              {runData.statistics.uncovered === 0 && (
-                isApproved ? (
-                  <Badge variant="success">Approved{runData.approvedBy ? ` by ${runData.approvedBy}` : ''}</Badge>
-                ) : (
-                  <Button onClick={handleApprove} disabled={approving} loading={approving} variant="success">
-                    <CheckCircle className="h-4 w-4" />
-                    Approve Plan
-                  </Button>
-                )
+              {isApproved ? (
+                <Badge variant="success">Approved{runData.approvedBy ? ` by ${runData.approvedBy}` : ''}</Badge>
+              ) : (
+                <Button onClick={handleApprove} disabled={approving} loading={approving} variant="success">
+                  <CheckCircle className="h-4 w-4" />
+                  {runData.statistics.uncovered > 0
+                    ? `Approve Anyway (${runData.statistics.uncovered} uncovered)`
+                    : 'Approve Plan'}
+                </Button>
               )}
             </div>
           </CardHeader>
@@ -475,7 +489,7 @@ export function SubstitutionPlanner() {
                           ? 'Team continues'
                           : 'As Scheduled'
                     return (
-                      <tr key={index} className={cn(substitution && (row.isSubstituted ? 'bg-primary-50/50' : 'bg-danger-50'))}>
+                      <tr key={entry?.id ?? `row-${index}`} className={cn(substitution && (row.isSubstituted ? 'bg-primary-50/50' : 'bg-danger-50'))}>
                         <td className="px-4 py-2 whitespace-nowrap text-secondary-700">{periodLabel(entry)}</td>
                         <td className="px-4 py-2 whitespace-nowrap text-secondary-900">{entry?.section?.name}</td>
                         <td className="px-4 py-2 text-secondary-700">{entry?.subject?.name}</td>

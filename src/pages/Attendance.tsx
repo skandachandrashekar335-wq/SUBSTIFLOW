@@ -70,6 +70,18 @@ export function Attendance() {
   }
 
   const handleMarkAllPresent = () => {
+    // One click otherwise overwrites EVERY mark for the day — including
+    // absences already recorded. Only ask when there is something to lose.
+    const alreadyMarked = faculty.filter(f => attendanceMap.has(f.id)).length
+    if (
+      alreadyMarked > 0 &&
+      !confirm(
+        `Mark all ${faculty.length} faculty present for ${today}? ` +
+          `Existing marks for ${alreadyMarked} faculty (including absences) will be overwritten.`
+      )
+    ) {
+      return
+    }
     try {
       const facultyIds = faculty.map(f => f.id)
       attendanceRepository.initializeAllPresent(today, facultyIds)
@@ -99,7 +111,7 @@ export function Attendance() {
     )
   }
 
-  const dayName = new Date(today).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+  const dayName = parseISODate(today).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">

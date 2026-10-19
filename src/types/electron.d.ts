@@ -11,14 +11,6 @@ declare global {
           params: unknown[]
         ) => { data?: { changes: number; lastInsertRowid: number | bigint }; error?: string }
         execSync: (sql: string) => { data?: unknown; error?: string }
-
-        query: (
-          sql: string,
-          params?: unknown[]
-        ) => Promise<{ data?: unknown[]; error?: string }>
-        transaction: (
-          sqls: { sql: string; params: unknown[] }[]
-        ) => Promise<{ data?: unknown[]; error?: string }>
       }
       backup: {
         exportBackup: () => Promise<{ success: boolean; path?: string; error?: string }>
@@ -38,6 +30,7 @@ declare global {
           userDataPath: string
           dbPath: string
           isDev: boolean
+          isDemo: boolean
         }>
       }
       print: {

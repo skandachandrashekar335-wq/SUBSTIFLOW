@@ -5,6 +5,7 @@ import {
   ArrowRight, Plus, BookOpen, Building2, FileText, Activity
 } from 'lucide-react'
 import { format } from 'date-fns'
+import { parseDbTimestamp } from '@/utils/date'
 import { Button } from '@/components/ui/Button'
 import { Card, CardHeader, CardBody } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
@@ -22,6 +23,7 @@ import {
 import {
   findAffectedEntries,
   getRunLifecycle,
+  computeCoverage,
   RUN_LIFECYCLE_LABELS,
 } from '@/services/substitution'
 import type { RunLifecycleStatus } from '@/services/substitution'
@@ -55,8 +57,16 @@ export function Dashboard() {
     if (!currentAcademicYear) return null
 
     const allFaculty = facultyRepository.findActive()
+    const activeIds = new Set(allFaculty.map(f => f.id))
     const absentFacultyIds = new Set(attendanceRepository.getAbsentFacultyIds(today))
-    const presentCount = allFaculty.length - absentFacultyIds.size
+    const presentIds = new Set(attendanceRepository.getPresentFacultyIds(today))
+    // "Present Today" counts only faculty EXPLICITLY marked present —
+    // unmarked faculty surface through the "marked" count in the banner and
+    // are never assumed present. (The old total-minus-absent overstated
+    // attendance whenever marking was incomplete.) Both sets are filtered to
+    // active faculty so archived rows cannot skew either tile.
+    const presentCount = allFaculty.filter(f => presentIds.has(f.id)).length
+    const absentCount = allFaculty.filter(f => absentFacultyIds.has(f.id)).length
 
     const dateObj = new Date(today + 'T00:00:00')
     const dayIndex = dateObj.getDay()
@@ -70,18 +80,22 @@ export function Dashboard() {
 
     const run = substitutionRunRepository.findByDate(today)
     const assignments = run ? substitutionAssignmentRepository.findByRun(run.id) : []
-    const covered = assignments.filter(a => a.substituteFacultyId).length
-    const uncovered = assignments.filter(a => !a.substituteFacultyId).length
+    // ONE coverage definition shared with the Planner and Reports
+    // (computeCoverage): a covered class has a substitute and the row was
+    // not REJECTED; uncovered is what remains of the affected set and can
+    // never go negative. Previously this tile counted raw rows, disagreeing
+    // with both other surfaces.
+    const coverage = computeCoverage(affectedEntries, assignments)
 
     return {
       totalFaculty: allFaculty.length,
       presentCount,
-      absentCount: absentFacultyIds.size,
-      markedCount: attendanceRepository.findByDate(today).length,
+      absentCount,
+      markedCount: attendanceRepository.findByDate(today).filter(r => activeIds.has(r.facultyId)).length,
       affectedEntries,
-      covered,
-      uncovered,
-      substitutionCount: covered,
+      covered: coverage.covered,
+      uncovered: coverage.uncovered,
+      substitutionCount: coverage.covered,
       hasRun: Boolean(run),
     }
   }, [currentAcademicYear, today])
@@ -95,11 +109,21 @@ export function Dashboard() {
     return { term: active, todayInRange }
   }, [today])
 
-  const recentActivity = useMemo(() => auditLogRepository.findRecent(8), [lifecycle, today])
+  // Computed fresh each render: audit entries appear from actions all over
+  // the app (settings edits, timetable edits, other dates) that change
+  // neither `lifecycle` nor `today`, so memoizing on those produced a stale
+  // activity list. `findRecent` is an indexed lookup — cheap enough.
+  const recentActivity = auditLogRepository.findRecent(8)
 
   const recentRuns = useMemo(() => {
-    return substitutionRunRepository.findAll().slice(0, 5)
-  }, [])
+    // Most recent RUN DATE first — `created_at` ordering misled whenever an
+    // older date was (re)generated after a newer one.
+    return substitutionRunRepository
+      .findAll()
+      .slice()
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+      .slice(0, 5)
+  }, [lifecycle])
 
   if (!currentAcademicYear) {
     return (
@@ -356,8 +380,12 @@ export function Dashboard() {
               <div className="p-6 text-center text-secondary-500">No activity recorded yet</div>
             ) : (
               <div className="divide-y divide-secondary-200">
-                {recentActivity.map((a) => (
-                  <div key={a.id} className="px-4 py-3" title={a.detail}>
+                {recentActivity.map((a, index) => (
+                  // Legacy audit rows (written by an old build) had a NULL id —
+                  // migration 7 backfills them, and this fallback keeps the list
+                  // renderable with unique keys even if such a row ever slips
+                  // through (e.g. an unrestored old backup).
+                  <div key={a.id ?? `audit-${a.action}-${a.createdAt}-${index}`} className="px-4 py-3" title={a.detail}>
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-sm font-medium text-secondary-900 truncate">
                         {AUDIT_LABELS[a.action] ?? a.action}
@@ -365,7 +393,7 @@ export function Dashboard() {
                       <span className="text-xs text-secondary-400 shrink-0">
                         {(() => {
                           try {
-                            return format(new Date(a.createdAt), 'MMM d, HH:mm')
+                            return format(parseDbTimestamp(a.createdAt), 'MMM d, HH:mm')
                           } catch {
                             return a.createdAt
                           }

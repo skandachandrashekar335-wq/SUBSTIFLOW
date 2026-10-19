@@ -154,7 +154,12 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
 
       if (covered.some(s => usedFacultySlots.get(facultyId)?.has(s.id))) continue
       const currentCount = facultySubCounts.get(facultyId) || 0
-      if (currentCount >= maxDailySubstitutions) continue
+      // BOTH configured ceilings apply and the stricter one wins: the
+      // faculty member's personal `maxDailySubstitutions` (Faculty page) and
+      // the institution-wide setting — previously the global setting silently
+      // overrode a raised personal limit.
+      const effectiveLimit = Math.min(candidate.faculty.maxDailySubstitutions, maxDailySubstitutions)
+      if (currentCount >= effectiveLimit) continue
 
       // Explainability: when subject-qualified faculty from other classes were
       // outranked by class familiarity, say so explicitly in the reasoning.
@@ -205,20 +210,25 @@ export function solveSubstitutionProblem(problem: SubstitutionProblem): {
     }
   }
 
-  // Restore original order for output
-  const dayOrder = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
+  // Restore original order for output — a TOTAL order: every entry that
+  // exists sorts by day (Sunday included) then slot; unknown entries sort
+  // last and ties break on entry id, so identical inputs always produce the
+  // identical persisted plan regardless of Map iteration order.
+  const dayOrder = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
   assignments.sort((a, b) => {
     const entryA = affectedEntries.find(e => e.id === a.originalEntryId)
     const entryB = affectedEntries.find(e => e.id === b.originalEntryId)
-    if (!entryA || !entryB) return 0
-    
-    const dayA = dayOrder.indexOf(entryA.dayOfWeek)
-    const dayB = dayOrder.indexOf(entryB.dayOfWeek)
+    if (!entryA && !entryB) return a.originalEntryId.localeCompare(b.originalEntryId)
+
+    const dayA = entryA ? dayOrder.indexOf(entryA.dayOfWeek) : dayOrder.length
+    const dayB = entryB ? dayOrder.indexOf(entryB.dayOfWeek) : dayOrder.length
     if (dayA !== dayB) return dayA - dayB
-    
-    const slotA = timeSlots.find(s => s.id === entryA.timeSlotId)?.order || 0
-    const slotB = timeSlots.find(s => s.id === entryB.timeSlotId)?.order || 0
-    return slotA - slotB
+
+    const slotA = entryA ? (timeSlots.find(s => s.id === entryA.timeSlotId)?.order ?? 0) : Number.MAX_SAFE_INTEGER
+    const slotB = entryB ? (timeSlots.find(s => s.id === entryB.timeSlotId)?.order ?? 0) : Number.MAX_SAFE_INTEGER
+    if (slotA !== slotB) return slotA - slotB
+
+    return a.originalEntryId.localeCompare(b.originalEntryId)
   })
 
   return { assignments, uncovered }
@@ -325,7 +335,13 @@ export function generateSubstitutionPlan(date: string, academicYearId: string): 
  * Save substitution run to database.
  *
  * Locked (manually overridden) assignments are never deleted or overwritten —
- * regeneration must respect them.
+ * regeneration must respect them — BUT a lock only survives while its
+ * activity is still affected by this run's absences. Every affected activity
+ * ends the solve as exactly one outcome (an assignment or an uncovered row),
+ * so a locked row whose entry is missing from both sets describes a class
+ * that is no longer affected (attendance changed, policy flipped): keeping it
+ * would report a substitute covering a class that does not need one, inflate
+ * the covered count and drive "uncovered" negative. Stale locks are dropped.
  */
 export function saveSubstitutionRun(
   date: string,
@@ -333,37 +349,54 @@ export function saveSubstitutionRun(
   uncovered: UncoveredEntry[]
 ): string {
   const db = getDatabase()
-  let runRow = db.prepare('SELECT id FROM substitution_runs WHERE date = ?').get(date) as { id: string } | undefined
+  const existing = db.prepare('SELECT id FROM substitution_runs WHERE date = ?').get(date) as { id: string } | undefined
+  const isNewRun = !existing
+  const runId = existing ? existing.id : crypto.randomUUID()
 
-  if (!runRow) {
-    const id = crypto.randomUUID()
-    // NOTE: better-sqlite3 builds SQLite with SQLITE_DQS=0 — double-quoted
-    // tokens are identifiers only, so these must be single-quoted literals.
-    db.prepare(
-      "INSERT INTO substitution_runs (id, date, status, generated_at, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'), datetime('now'))"
-    ).run(id, date, 'GENERATED')
-    runRow = { id }
-  } else {
-    // Regeneration supersedes any previous approval — status AND approval
-    // metadata reset together (a GENERATED run with a leftover approved_by
-    // would misrepresent who signed off on what).
-    db.prepare(
-      "UPDATE substitution_runs SET status = ?, approved_at = NULL, approved_by = NULL, generated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
-    ).run('GENERATED', runRow.id)
-  }
-
-  const runId = runRow.id
-
-  // Remember locked overrides so they survive regeneration.
-  const lockedRows = db
-    .prepare('SELECT original_entry_id FROM substitution_assignments WHERE run_id = ? AND is_locked = 1')
-    .all(runId) as { original_entry_id: string }[]
-  const lockedEntryIds = new Set(lockedRows.map((r) => r.original_entry_id))
+  // Every affected activity ends the solve as exactly one outcome.
+  const stillAffected = new Set([
+    ...assignments.map(a => a.originalEntryId),
+    ...uncovered.map(u => u.originalEntryId),
+  ])
 
   // Persist the whole plan atomically: if any insert fails, the DELETE is
-  // rolled back too, so the previous plan is never left half-replaced.
+  // rolled back too, so the previous plan is never left half-replaced. The
+  // approval reset runs INSIDE the same transaction — previously it landed
+  // before BEGIN, so a failed save cleared the approval while the rollback
+  // restored the old assignments, leaving an un-approved plan that looked
+  // untouched.
   db.exec('BEGIN')
   try {
+    if (!isNewRun) {
+      // Regeneration supersedes any previous approval — status AND approval
+      // metadata reset together (a GENERATED run with a leftover approved_by
+      // would misrepresent who signed off on what).
+      db.prepare(
+        "UPDATE substitution_runs SET status = 'GENERATED', approved_at = NULL, approved_by = NULL, generated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+      ).run(runId)
+    } else {
+      // The run row is created INSIDE the transaction: a failed save must
+      // never leave behind an orphan empty run (the exact state the delete
+      // path explicitly guards against).
+      // NOTE: better-sqlite3 builds SQLite with SQLITE_DQS=0 — double-quoted
+      // tokens are identifiers only, so these must be single-quoted literals.
+      db.prepare(
+        "INSERT INTO substitution_runs (id, date, status, generated_at, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'), datetime('now'))"
+      ).run(runId, date, 'GENERATED')
+    }
+
+    // Remember locked overrides so they survive regeneration — minus stale
+    // ones (see function doc).
+    const lockedRows = db
+      .prepare('SELECT original_entry_id FROM substitution_assignments WHERE run_id = ? AND is_locked = 1')
+      .all(runId) as { original_entry_id: string }[]
+    const lockedEntryIds = new Set(
+      lockedRows.map(r => r.original_entry_id).filter(id => stillAffected.has(id))
+    )
+    const staleLocks = lockedRows.filter(r => !stillAffected.has(r.original_entry_id))
+    const deleteById = db.prepare('DELETE FROM substitution_assignments WHERE run_id = ? AND original_entry_id = ?')
+    for (const row of staleLocks) deleteById.run(runId, row.original_entry_id)
+
     // Clear only non-locked assignments.
     db.prepare('DELETE FROM substitution_assignments WHERE run_id = ? AND is_locked = 0').run(runId)
 

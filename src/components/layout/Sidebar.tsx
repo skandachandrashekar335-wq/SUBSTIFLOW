@@ -1,4 +1,5 @@
-import { LayoutDashboard, Users, Calendar, Clock, BookOpen, Building2, FileText, Settings, Database, CheckSquare, Grid } from 'lucide-react'
+import { LayoutDashboard, Users, Calendar, Clock, BookOpen, Building2, FileText, Settings, Database, CheckSquare, Grid, UsersRound, BookCheck, Zap } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { useAppStore } from '@/stores/appStore'
 import { cn } from '@/utils/cn'
@@ -8,6 +9,9 @@ const navigation = [
   { name: "Today's Attendance", href: '/attendance', icon: CheckSquare },
   { name: 'Substitution Planner', href: '/substitution', icon: Calendar },
   { name: 'Master Timetable', href: '/timetable', icon: Grid },
+  { name: 'Teaching Allocations', href: '/teaching', icon: UsersRound },
+  { name: 'Subject Requirements', href: '/requirements', icon: BookCheck },
+  { name: 'Timetable Generation', href: '/generation', icon: Zap },
   { name: 'Faculty', href: '/faculty', icon: Users },
   { name: 'Subjects', href: '/subjects', icon: BookOpen },
   { name: 'Classes', href: '/classes', icon: Building2 },
@@ -20,6 +24,20 @@ const navigation = [
 export function Sidebar() {
   const { sidebarOpen, toggleSidebar, currentAcademicYear } = useAppStore()
   const location = useLocation()
+  // The real version comes from the main process — a hardcoded literal would
+  // drift from package.json at the first release after 1.0.0 and mislead
+  // every bug report ("I'm on 1.0.0" while running something newer).
+  const [appVersion, setAppVersion] = useState<string | null>(null)
+  const [isDemo, setIsDemo] = useState(false)
+  useEffect(() => {
+    window.electron?.app
+      .getInfo()
+      .then((info) => {
+        setAppVersion(info && 'version' in info ? info.version : null)
+        setIsDemo(!!(info && 'isDemo' in info && info.isDemo))
+      })
+      .catch(() => setAppVersion(null))
+  }, [])
 
   return (
     <aside className={cn(
@@ -86,8 +104,13 @@ export function Sidebar() {
 
         {/* Footer */}
         <div className={cn('p-4 border-t border-secondary-200', !sidebarOpen && 'hidden')}>
+          {isDemo && (
+            <div className="mb-2 rounded-md bg-danger-600 px-2 py-1 text-center text-[10px] font-bold uppercase tracking-wider text-white">
+              Demo Data
+            </div>
+          )}
           <div className="text-xs text-secondary-500 text-center">
-            SubstiFlow v1.0.0
+            SubstiFlow{appVersion ? ` v${appVersion}` : ''}
           </div>
         </div>
       </div>

@@ -92,7 +92,8 @@ export class SubstitutionAssignmentRepository extends BaseRepository<Substitutio
       SELECT
         sa.id, sa.run_id, sa.original_entry_id, sa.substitute_faculty_id,
         sa.status, sa.score, sa.reasoning, sa.is_locked, sa.created_at, sa.updated_at,
-        f.name as substitute_faculty_name
+        f.name as substitute_faculty_name,
+        f.staff_type as substitute_faculty_staff_type
       FROM substitution_assignments sa
       LEFT JOIN faculty f ON sa.substitute_faculty_id = f.id
       WHERE sa.run_id = ?
@@ -137,6 +138,7 @@ export class SubstitutionAssignmentRepository extends BaseRepository<Substitutio
             name: row.substitute_faculty_name,
             departmentId: '',
             isActive: true,
+            staffType: row.substitute_faculty_staff_type ?? 'TEACHING',
             maxDailySubstitutions: 2,
             priority: 0,
             createdAt: '',

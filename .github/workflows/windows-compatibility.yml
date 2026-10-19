@@ -1,0 +1,111 @@
+name: Windows Compatibility
+
+# Windows-targeted compatibility gate, separate from the macOS CI pipeline.
+#
+# What this workflow can prove: that the project installs from the lockfile,
+# passes the unit/integration suite, typechecks, builds, and produces a real
+# Windows NSIS installer on a windows-latest runner — and that installer is
+# uploaded so a maintainer can install it on an actual Windows desktop.
+#
+# What it CANNOT prove on its own: that the packaged app *runs* correctly on
+# Windows. The `windows-runtime-smoke` job drives the real GUI application
+# under Playwright Electron on the runner; it is marked experimental
+# (continue-on-error) until it has been observed green at least once, and a
+# green workflow badge does NOT mean the smoke job passed — read its log.
+#
+# No new package scripts are introduced here: every step reuses the existing
+# `package.json` scripts (`npm ci`, `npm test`, `npm run build`, `npm run
+# dist`, `npm run e2e`). `npm run dist` already handles the native-module
+# dance on Windows: `predist` stamps better-sqlite3 with the win32-x64
+# Electron prebuild, then electron-builder packages it with `npmRebuild:
+# false`.
+
+on: [push, pull_request]
+
+jobs:
+  windows-verify:
+    name: Windows install, test, typecheck, build, NSIS package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Clean install from lockfile
+        run: npm ci
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Typecheck (renderer)
+        run: npx tsc --noEmit
+
+      - name: Typecheck (electron main)
+        run: npx tsc -p tsconfig.electron.json --noEmit
+
+      - name: Build application (renderer + electron main + assets)
+        run: npm run build
+
+      - name: Build Windows NSIS installer (npm run dist)
+        # electron-builder publishes nothing here: publishing only happens
+        # with an explicit `--publish` policy, which `npm run dist` does not
+        # pass, and no GH_TOKEN is provided to this job.
+        run: npm run dist
+
+      - name: Verify the installer artifact exists and looks sane
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist-electron\SubstiFlow-Setup.exe -ErrorAction Stop
+          if ($exe.Length -lt 10MB) {
+            throw "installer is suspiciously small: $($exe.Length) bytes"
+          }
+          $latest = Get-Item dist-electron\latest.yml -ErrorAction Stop
+          Write-Host "installer: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
+          Write-Host "latest.yml: $($latest.FullName)"
+
+      - name: Upload installer for manual testing on a Windows desktop
+        uses: actions/upload-artifact@v4
+        with:
+          name: substiflow-windows-nsis-installer
+          path: |
+            dist-electron/SubstiFlow-Setup.exe
+            dist-electron/latest.yml
+          if-no-files-found: error
+
+  windows-runtime-smoke:
+    # EXPERIMENTAL — non-blocking until observed green.
+    #
+    # Drives the REAL application (Electron + renderer + SQLite) on a Windows
+    # runner through every core workflow in an isolated SUBSTIFLOW_DATA_DIR:
+    # first-run wizard, subject/teaching-faculty creation, non-teaching staff
+    # exclusion, TEAM lab + ALTERNATE arrangement, generate → validate →
+    # publish, relaunch persistence, attendance → substitution, migration
+    # upgrade, and an offline assertion (no external network requests).
+    # The runner is a real Windows session, so GUI launch is supported there;
+    # it has NOT been verified for this repository yet — inspect the job log
+    # rather than trusting the workflow status.
+    name: Windows GUI runtime smoke (experimental)
+    needs: windows-verify
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Clean install from lockfile
+        run: npm ci
+
+      - name: E2E journeys against the real app (isolated temp database)
+        # `npm run e2e` builds the app itself, points SUBSTIFLOW_DATA_DIR at
+        # a fresh temp directory (the production database is never opened),
+        # and stamps the native module ABI for Electron and back.
+        run: npm run e2e

@@ -17,5 +17,11 @@
     "types": ["node"]
   },
   "include": ["electron/**/*", "src/db/**/*", "src/types/**/*"],
-  "exclude": ["node_modules", "dist", "src/db/repositories/**/*", "src/db/database.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/db/repositories/**/*",
+    "src/db/database.ts",
+    "src/db/transaction.ts"
+  ]
 }

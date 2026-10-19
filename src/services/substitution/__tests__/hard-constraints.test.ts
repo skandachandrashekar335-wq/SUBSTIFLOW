@@ -9,9 +9,10 @@ import { attendanceRepository } from '@/db/repositories/attendance'
 import { timeSlotRepository } from '@/db/repositories/timeSlot'
 import { academicYearRepository } from '@/db/repositories/academicYear'
 import { departmentRepository } from '@/db/repositories/department'
+import { substitutionAssignmentRepository } from '@/db/repositories'
 import { buildFacultyAvailability, solveSubstitutionProblem } from '@/services/substitution/engine'
 import { getEligibleCandidates } from '@/services/substitution/scoring'
-import { updateSubstitutionAssignment, availableSubstitutesForAssignment } from '@/services/substitution'
+import { updateSubstitutionAssignment, availableSubstitutesForAssignment, validateSubstituteAssignment } from '@/services/substitution'
 import { DEFAULT_SUBSTITUTION_WEIGHTS } from '@/types'
 import type { TimetableEntryWithRelations } from '@/types'
 import type { SubstitutionProblem } from '../types'
@@ -188,6 +189,16 @@ describe('Hard-constraint audit', () => {
       const ids = candidatesFor('tt-absent-a', ['fac-absent'])
       expect(ids[0]).toBe('fac-same')
     })
+
+    it('never offers non-teaching staff, however free and qualified they are', () => {
+      // The distinction lives on the Faculty record — nothing is inferred.
+      facultyRepository.update('fac-freelancer', { staffType: 'NON_TEACHING' })
+      expect(candidatesFor('tt-absent-a', ['fac-absent'])).not.toContain('fac-freelancer')
+
+      // Re-classified as teaching staff → considered again immediately.
+      facultyRepository.update('fac-freelancer', { staffType: 'TEACHING' })
+      expect(candidatesFor('tt-absent-a', ['fac-absent'])).toContain('fac-freelancer')
+    })
   })
 
   describe('engine never double-books', () => {
@@ -232,6 +243,14 @@ describe('Hard-constraint audit', () => {
       expect(ids).not.toContain('fac-freelancer')
       expect(ids).toContain('fac-same')
     })
+
+    it('never lists non-teaching staff as a possible substitute', () => {
+      facultyRepository.update('fac-freelancer', { staffType: 'NON_TEACHING' })
+      const id = seedAssignment('asg-picker-nonteaching', 'tt-absent-a', 'fac-same', 'PENDING')
+      const ids = availableSubstitutesForAssignment(id).map((f) => f.id)
+      expect(ids).not.toContain('fac-freelancer')
+      expect(ids).toContain('fac-same')
+    })
   })
 
   describe('manual override enforces the same constraints', () => {
@@ -264,6 +283,21 @@ describe('Hard-constraint audit', () => {
       const result = updateSubstitutionAssignment(id, { substituteFacultyId: 'fac-same' })
       expect(result).not.toBeNull()
       expect(result.substituteFacultyId).toBe('fac-same')
+    })
+
+    it('rejects a non-teaching staff member with a clear reason', () => {
+      facultyRepository.update('fac-freelancer', { staffType: 'NON_TEACHING' })
+      const id = seedAssignment('asg-nonteaching', 'tt-absent-a', 'fac-same', 'PENDING')
+
+      const check = validateSubstituteAssignment(id, 'fac-freelancer')
+      expect(check.ok).toBe(false)
+      expect(check.reason).toMatch(/non-teaching/i)
+
+      // The service layer refuses the write for the same reason.
+      expect(updateSubstitutionAssignment(id, { substituteFacultyId: 'fac-freelancer' })).toBeNull()
+      expect(
+        substitutionAssignmentRepository.findById(id)!.substituteFacultyId
+      ).toBe('fac-same')
     })
   })
 })

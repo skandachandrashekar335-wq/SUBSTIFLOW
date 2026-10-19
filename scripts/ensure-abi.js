@@ -33,12 +33,41 @@ if (!VALID.includes(target)) {
 }
 
 function run(cmd, args, opts = {}) {
-  return spawnSync(cmd, args, {
+  return spawnSync(process.platform === 'win32' ? `"${cmd}"` : cmd, args, {
     stdio: 'inherit',
     cwd: root,
     shell: process.platform === 'win32',
     ...opts,
   })
+}
+
+const nativeBinary = path.join(nativeModuleDir, 'build', 'Release', 'better_sqlite3.node')
+
+/** Platform token of a stamp (`electron@31.7.7:win32-x64` → `win32`). */
+function stampPlatform(stamp) {
+  return stamp.split(':').pop().split('-')[0]
+}
+
+/**
+ * The stamp on its own is content-blind: it records what was REQUESTED, not
+ * what is ON DISK. A stale stamp (e.g. after `npm rebuild` re-extracted a
+ * host build) would otherwise short-circuit straight into the Windows
+ * installer and crash on first launch. Read the binary's magic bytes and
+ * confirm they are actually the platform the stamp claims.
+ */
+function binaryMatchesPlatform(platform) {
+  if (!fs.existsSync(nativeBinary)) return false
+  const fd = fs.openSync(nativeBinary, 'r')
+  try {
+    const header = Buffer.alloc(4)
+    fs.readSync(fd, header, 0, 4, 0)
+    if (platform === 'win32') return header[0] === 0x4d && header[1] === 0x5a // "MZ" (PE)
+    if (platform === 'linux') return header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46 // ELF
+    const magic = header.readUInt32LE(0) // Mach-O 32/64 LE/BE + universal fat
+    return [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe].includes(magic)
+  } finally {
+    fs.closeSync(fd)
+  }
 }
 
 function electronVersion() {
@@ -54,7 +83,7 @@ function desiredStamp() {
 
 const wanted = desiredStamp()
 const current = fs.existsSync(stampFile) ? fs.readFileSync(stampFile, 'utf-8').trim() : ''
-if (current === wanted) {
+if (current === wanted && binaryMatchesPlatform(stampPlatform(wanted))) {
   process.exit(0)
 }
 
@@ -83,6 +112,13 @@ if (target === 'win32') {
 } else {
   ok = run('npx', ['electron-rebuild', '-f', '-w', 'better-sqlite3']).status === 0
   hint = '  npx electron-rebuild -f -w better-sqlite3'
+}
+
+// A zero exit code is not proof the right binary landed (a prebuild download
+// can "succeed" without extracting). Never write a stamp the file on disk
+// does not back.
+if (ok && !binaryMatchesPlatform(stampPlatform(wanted))) {
+  ok = false
 }
 
 if (!ok) {

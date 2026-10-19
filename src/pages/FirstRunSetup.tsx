@@ -18,6 +18,7 @@ import {
   roomRepository,
   timeSlotRepository
 } from '@/db/repositories'
+import { withTransaction } from '@/db/transaction'
 import { DEFAULT_WORKING_HOURS } from '@/types'
 import { cn } from '@/utils/cn'
 
@@ -34,6 +35,15 @@ const STEPS = [
   { id: 10, title: 'Finish', description: 'Complete setup', icon: CheckSquare },
 ]
 
+// Sensible defaults derived from TODAY — a wizard opened in 2026 must not
+// propose a stale "2024-2025". Academic years run June → May here: before
+// June the current year is still the previous cycle.
+const defaultStartYear =
+  new Date().getMonth() >= 5 ? new Date().getFullYear() : new Date().getFullYear() - 1
+const DEFAULT_YEAR_NAME = `${defaultStartYear}-${defaultStartYear + 1}`
+const DEFAULT_YEAR_START = `${defaultStartYear}-06-01`
+const DEFAULT_YEAR_END = `${defaultStartYear + 1}-05-31`
+
 export function FirstRunSetup() {
   const [currentStep, setCurrentStep] = useState(1)
   const { completeSetup, loadActiveAcademicYear } = useAppStore()
@@ -41,9 +51,9 @@ export function FirstRunSetup() {
   // Form states
   const [institutionName, setInstitutionName] = useState('')
   const [institutionAddress, setInstitutionAddress] = useState('')
-  const [yearName, setYearName] = useState('2024-2025')
-  const [yearStart, setYearStart] = useState('2024-06-01')
-  const [yearEnd, setYearEnd] = useState('2025-05-31')
+  const [yearName, setYearName] = useState(DEFAULT_YEAR_NAME)
+  const [yearStart, setYearStart] = useState(DEFAULT_YEAR_START)
+  const [yearEnd, setYearEnd] = useState(DEFAULT_YEAR_END)
   const [workingHours, setWorkingHours] = useState(DEFAULT_WORKING_HOURS)
   const [deptName, setDeptName] = useState('')
   const [deptCode, setDeptCode] = useState('')
@@ -67,7 +77,15 @@ export function FirstRunSetup() {
     switch (currentStep) {
       case 1: return true
       case 2: return institutionName.trim().length > 0
-      case 3: return yearName.trim().length > 0 && yearStart && yearEnd
+      case 3:
+        // End must not precede Start — previously any two dates were
+        // accepted, creating an inverted year that nothing could schedule.
+        return (
+          yearName.trim().length > 0 &&
+          Boolean(yearStart) &&
+          Boolean(yearEnd) &&
+          yearEnd >= yearStart
+        )
       case 4: return true
       case 5: return deptName.trim().length > 0 && deptCode.trim().length > 0
       case 6: return facultyName.trim().length > 0
@@ -89,8 +107,11 @@ export function FirstRunSetup() {
     try {
       switch (currentStep) {
         case 2:
-          settingsRepository.setInstitutionName(institutionName.trim())
-          settingsRepository.setInstitutionAddress(institutionAddress.trim())
+          // Two settings writes: land together or not at all.
+          withTransaction(() => {
+            settingsRepository.setInstitutionName(institutionName.trim())
+            settingsRepository.setInstitutionAddress(institutionAddress.trim())
+          })
           break
         case 3: {
           // Idempotent: going Back and pressing Next again updates the year
@@ -105,11 +126,15 @@ export function FirstRunSetup() {
           break
         }
         case 4:
-          settingsRepository.setWorkingHours(workingHours)
-          timeSlotRepository.initializeDefaults()
-          // Make the configured hours real: regenerate the periods so they
-          // match (repeat presses are a no-op when nothing changed).
-          timeSlotRepository.rebuildFromWorkingHours(workingHours)
+          // Hours + periods are one concept: never leave one updated without
+          // the other.
+          withTransaction(() => {
+            settingsRepository.setWorkingHours(workingHours)
+            timeSlotRepository.initializeDefaults()
+            // Make the configured hours real: regenerate the periods so they
+            // match (repeat presses are a no-op when nothing changed).
+            timeSlotRepository.rebuildFromWorkingHours(workingHours)
+          })
           break
         case 5: {
           const payload = { name: deptName.trim(), code: deptCode.trim().toUpperCase() }
@@ -147,12 +172,15 @@ export function FirstRunSetup() {
           const subj = existing
             ? subjectRepository.update(existing.id, payload)!
             : subjectRepository.create({ id: crypto.randomUUID(), ...payload })
-          setCreatedSubjectId(subj.id)
           if (createdFacultyId) {
-            facultyRepository.setSubjects(createdFacultyId, [
-              { facultyId: createdFacultyId, subjectId: subj.id, proficiency: 3 }
-            ])
+            // Subject row and its proficiency mapping: all or nothing.
+            withTransaction(() => {
+              facultyRepository.setSubjects(createdFacultyId, [
+                { facultyId: createdFacultyId, subjectId: subj.id, proficiency: 3 }
+              ])
+            })
           }
+          setCreatedSubjectId(subj.id)
           break
         }
         case 8: {
@@ -167,10 +195,13 @@ export function FirstRunSetup() {
           const sec = existing
             ? sectionRepository.update(existing.id, payload)!
             : sectionRepository.create({ id: crypto.randomUUID(), ...payload })
-          setCreatedSectionId(sec.id)
           if (createdFacultyId) {
-            facultyRepository.setSections(createdFacultyId, [sec.id])
+            // Section row and its assignment mapping: all or nothing.
+            withTransaction(() => {
+              facultyRepository.setSections(createdFacultyId, [sec.id])
+            })
           }
+          setCreatedSectionId(sec.id)
           break
         }
         case 9: {
@@ -240,11 +271,16 @@ export function FirstRunSetup() {
         return (
           <div className="space-y-4">
             <h2 className="text-xl font-semibold text-secondary-900">Academic Year</h2>
-            <Input label="Year Name" value={yearName} onChange={(e) => setYearName(e.target.value)} placeholder="e.g., 2024-2025" autoFocus />
+            <Input label="Year Name" value={yearName} onChange={(e) => setYearName(e.target.value)} placeholder="e.g., 2025-2026" autoFocus />
             <div className="grid grid-cols-2 gap-4">
               <Input label="Start Date" type="date" value={yearStart} onChange={(e) => setYearStart(e.target.value)} />
               <Input label="End Date" type="date" value={yearEnd} onChange={(e) => setYearEnd(e.target.value)} />
             </div>
+            {yearEnd && yearStart && yearEnd < yearStart && (
+              <p className="text-sm text-danger-600" role="alert">
+                The end date must be on or after the start date.
+              </p>
+            )}
           </div>
         )
 

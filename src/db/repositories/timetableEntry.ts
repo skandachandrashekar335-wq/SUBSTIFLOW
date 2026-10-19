@@ -1,4 +1,5 @@
 import { BaseRepository, toColumn } from './base'
+import { withTransaction } from '../transaction'
 import {
   TimetableEntry,
   TimetableEntryWithRelations,
@@ -15,6 +16,7 @@ function rowToFaculty(row: any): Faculty {
     employeeId: row.employee_id ?? undefined,
     departmentId: row.department_id,
     isActive: Boolean(row.is_active),
+    staffType: row.staff_type ?? 'TEACHING',
     maxDailySubstitutions: row.max_daily_substitutions,
     priority: row.priority ?? 0,
     notes: row.notes ?? undefined,
@@ -100,7 +102,7 @@ export class TimetableEntryRepository extends BaseRepository<TimetableEntry> {
     for (const row of db
       .prepare(
         `SELECT tef.entry_id, f.id, f.name, f.employee_id, f.department_id, f.is_active,
-                f.max_daily_substitutions, f.priority, f.notes, f.created_at, f.updated_at
+                f.staff_type, f.max_daily_substitutions, f.priority, f.notes, f.created_at, f.updated_at
          FROM timetable_entry_faculty tef
          JOIN faculty f ON f.id = tef.faculty_id
          WHERE tef.entry_id IN (${ph})
@@ -252,7 +254,11 @@ export class TimetableEntryRepository extends BaseRepository<TimetableEntry> {
   }
 
   bulkCreate(entries: any[]): void {
-    for (const entry of entries) this.create(entry)
+    // One transaction for the whole batch: a failure half-way (or a crash)
+    // must never leave a partially imported timetable.
+    withTransaction(() => {
+      for (const entry of entries) this.create(entry)
+    })
   }
 
   deleteByAcademicYear(academicYearId: string): number {

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS faculty (
     employee_id TEXT UNIQUE,
     department_id TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
+    staff_type TEXT NOT NULL DEFAULT 'TEACHING' CHECK (staff_type IN ('TEACHING', 'NON_TEACHING')),
     max_daily_substitutions INTEGER NOT NULL DEFAULT 2,
     priority INTEGER NOT NULL DEFAULT 0,
     notes TEXT,
@@ -341,4 +342,169 @@ CREATE TRIGGER IF NOT EXISTS update_terms_updated_at
 AFTER UPDATE ON terms
 BEGIN
     UPDATE terms SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+-- ============================================================================
+-- PHASE 1: AUTOMATIC MASTER TIMETABLE GENERATION
+-- ============================================================================
+
+-- Teaching Allocations
+-- One row = Faculty X teaches Subject Y to Section Z, K periods/week as ClassType T.
+-- Multi-faculty labs: same section+subject, multiple faculty rows with same required_sessions.
+CREATE TABLE IF NOT EXISTS teaching_allocations (
+    id TEXT PRIMARY KEY,
+    academic_year_id TEXT NOT NULL,
+    faculty_id TEXT NOT NULL,
+    section_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    class_type TEXT NOT NULL DEFAULT 'LECTURE',
+    required_sessions_per_week INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE,
+    FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE RESTRICT,
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
+    UNIQUE(academic_year_id, faculty_id, section_id, subject_id, class_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_teaching_allocations_academic_year ON teaching_allocations(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_teaching_allocations_faculty ON teaching_allocations(faculty_id);
+CREATE INDEX IF NOT EXISTS idx_teaching_allocations_section ON teaching_allocations(section_id);
+CREATE INDEX IF NOT EXISTS idx_teaching_allocations_subject ON teaching_allocations(subject_id);
+
+-- Subject Requirements
+-- One row = Section + Subject + ClassType + required weekly sessions + span.
+CREATE TABLE IF NOT EXISTS subject_requirements (
+    id TEXT PRIMARY KEY,
+    academic_year_id TEXT NOT NULL,
+    section_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    class_type TEXT NOT NULL DEFAULT 'LECTURE',
+    required_sessions_per_week INTEGER NOT NULL DEFAULT 1,
+    span INTEGER NOT NULL DEFAULT 1,
+    teaching_arrangement TEXT NOT NULL DEFAULT 'AUTO' CHECK (teaching_arrangement IN ('AUTO', 'TEAM', 'ALTERNATE')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE,
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
+    UNIQUE(academic_year_id, section_id, subject_id, class_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subject_requirements_academic_year ON subject_requirements(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_subject_requirements_section ON subject_requirements(section_id);
+CREATE INDEX IF NOT EXISTS idx_subject_requirements_subject ON subject_requirements(subject_id);
+
+CREATE TRIGGER IF NOT EXISTS update_subject_requirements_updated_at
+AFTER UPDATE ON subject_requirements
+BEGIN
+    UPDATE subject_requirements SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+-- Timetable Generations (generation runs)
+CREATE TABLE IF NOT EXISTS timetable_generations (
+    id TEXT PRIMARY KEY,
+    academic_year_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+    constraints_snapshot TEXT NOT NULL DEFAULT '{}',
+    diagnostics_summary TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_timetable_generations_academic_year ON timetable_generations(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_generations_status ON timetable_generations(status);
+
+-- Draft Timetable Entries (generator output — DRAFT timetable)
+-- Separate from timetable_entries so generation is non-destructive.
+CREATE TABLE IF NOT EXISTS draft_timetable_entries (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL,
+    academic_year_id TEXT NOT NULL,
+    day_of_week TEXT NOT NULL,
+    time_slot_id TEXT NOT NULL,
+    section_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    class_type TEXT NOT NULL DEFAULT 'LECTURE',
+    span INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT', 'PUBLISHED')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES timetable_generations(id) ON DELETE CASCADE,
+    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id) ON DELETE CASCADE,
+    FOREIGN KEY (time_slot_id) REFERENCES time_slots(id) ON DELETE RESTRICT,
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
+    UNIQUE(generation_id, day_of_week, time_slot_id, section_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_entries_generation ON draft_timetable_entries(generation_id);
+CREATE INDEX IF NOT EXISTS idx_draft_entries_academic_year ON draft_timetable_entries(academic_year_id);
+CREATE INDEX IF NOT EXISTS idx_draft_entries_section ON draft_timetable_entries(section_id);
+
+-- Generation Diagnostics (failed/uncovered activity explanations)
+-- teaching_allocation_id is optional: a diagnostic may describe a problem that
+-- is not attributable to one allocation ("No teaching allocations are defined").
+CREATE TABLE IF NOT EXISTS generation_diagnostics (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL,
+    teaching_allocation_id TEXT,
+    severity TEXT NOT NULL DEFAULT 'ERROR' CHECK (severity IN ('ERROR', 'WARNING', 'INFO')),
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES timetable_generations(id) ON DELETE CASCADE,
+    FOREIGN KEY (teaching_allocation_id) REFERENCES teaching_allocations(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_diagnostics_generation ON generation_diagnostics(generation_id);
+CREATE INDEX IF NOT EXISTS idx_generation_diagnostics_allocation ON generation_diagnostics(teaching_allocation_id);
+
+-- Draft Timetable Entry Faculty (join table for draft entries)
+CREATE TABLE IF NOT EXISTS draft_timetable_entry_faculty (
+    entry_id TEXT NOT NULL,
+    faculty_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (entry_id, faculty_id),
+    FOREIGN KEY (entry_id) REFERENCES draft_timetable_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (faculty_id) REFERENCES faculty(id) ON DELETE RESTRICT
+);
+
+-- Draft Timetable Entry Rooms (join table for draft entries)
+CREATE TABLE IF NOT EXISTS draft_timetable_entry_rooms (
+    entry_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (entry_id, room_id),
+    FOREIGN KEY (entry_id) REFERENCES draft_timetable_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE RESTRICT
+);
+
+-- Triggers for updated_at (Phase 1 tables)
+CREATE TRIGGER IF NOT EXISTS update_teaching_allocations_updated_at
+AFTER UPDATE ON teaching_allocations
+BEGIN
+    UPDATE teaching_allocations SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_timetable_generations_updated_at
+AFTER UPDATE ON timetable_generations
+BEGIN
+    UPDATE timetable_generations SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_draft_timetable_entries_updated_at
+AFTER UPDATE ON draft_timetable_entries
+BEGIN
+    UPDATE draft_timetable_entries SET updated_at = datetime('now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_generation_diagnostics_updated_at
+AFTER UPDATE ON generation_diagnostics
+BEGIN
+    UPDATE generation_diagnostics SET updated_at = datetime('now') WHERE id = NEW.id;
 END;

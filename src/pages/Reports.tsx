@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react'
 import { format, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns'
+import { parseISODate } from '@/utils/date'
 import { FileText, Download, Calendar, Users, AlertTriangle, CheckCircle, Printer, Table2 } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import { Button } from '@/components/ui/Button'
@@ -11,6 +12,7 @@ import { Input } from '@/components/ui/Input'
 import { useAppStore } from '@/stores/appStore'
 import { facultyRepository, substitutionRunRepository, substitutionAssignmentRepository, timetableEntryRepository, attendanceRepository, timeSlotRepository, settingsRepository } from '@/db/repositories'
 import { findAffectedEntries } from '@/services/substitution/engine'
+import { computeCoverage } from '@/services/substitution'
 
 type ReportType = 'daily' | 'monthly' | 'faculty-stats' | 'uncovered'
 
@@ -54,22 +56,26 @@ export function Reports() {
     const affectedEntries = findAffectedEntries(absentIds, dayOfWeek as any, currentAcademicYear.id)
     const affected = affectedEntries.length
 
-    const covered = assignments.filter(a => a.substituteFacultyId).length
+    // ONE coverage definition shared with the Dashboard and Planner
+    // (computeCoverage): REJECTED rows are not coverage, and "uncovered" is
+    // what remains of the affected set — it can never go negative in an
+    // exported report.
+    const coverage = computeCoverage(affected, assignments)
 
     return {
       run,
       assignments,
       absentFaculty,
       affected,
-      covered,
-      uncovered: affected - covered,
+      covered: coverage.covered,
+      uncovered: coverage.uncovered,
     }
   }, [reportType, selectedDate, currentAcademicYear])
 
   const monthlyData = useMemo(() => {
     if (reportType !== 'monthly' || !currentAcademicYear) return null
 
-    const startDate = startOfMonth(new Date(month + '-01'))
+    const startDate = startOfMonth(parseISODate(month + '-01'))
     const endDate = endOfMonth(startDate)
     const days = eachDayOfInterval({ start: startDate, end: endDate })
 
@@ -81,13 +87,19 @@ export function Reports() {
     const facultyStats = facultyRepository.findActive().map(f => {
       let totalSubs = 0
       let totalAbsent = 0
+      // Distinct run dates this faculty actually covered — the export column
+      // "Substitution Days Run" is PER FACULTY. It previously repeated the
+      // month's total run count on every faculty row.
+      const servedDates = new Set<string>()
       for (const run of runs) {
         const assignments = substitutionAssignmentRepository.findByRunWithRelations(run.id)
-        totalSubs += assignments.filter(a => a.substituteFacultyId === f.id).length
+        const mine = assignments.filter(a => a.substituteFacultyId === f.id && a.status !== 'REJECTED')
+        totalSubs += mine.length
+        if (mine.length > 0) servedDates.add(run.date)
         const attendance = attendanceRepository.findByDateAndFaculty(run.date, f.id)
         if (attendance?.status === 'ABSENT') totalAbsent++
       }
-      return { faculty: f, totalSubs, totalAbsent, days: days.length }
+      return { faculty: f, totalSubs, totalAbsent, servedDays: servedDates.size, days: days.length }
     }).sort((a, b) => b.totalSubs - a.totalSubs)
 
     return { runs, facultyStats, days }
@@ -104,7 +116,8 @@ export function Reports() {
       let asOriginal = 0
       for (const run of allRuns) {
         const assignments = substitutionAssignmentRepository.findByRunWithRelations(run.id)
-        totalSubs += assignments.filter(a => a.substituteFacultyId === f.id).length
+        // REJECTED rows are refusals, not substitutions — they never count.
+        totalSubs += assignments.filter(a => a.substituteFacultyId === f.id && a.status !== 'REJECTED').length
         asOriginal += assignments.filter(a => a.originalEntry?.facultyIds.includes(f.id) ?? false).length
       }
       return { faculty: f, totalSubs, asOriginal }
@@ -115,7 +128,7 @@ export function Reports() {
     if (reportType !== 'uncovered' || !currentAcademicYear) return null
 
     const allRuns = substitutionRunRepository.findAll()
-    const uncoveredEntries: { date: string; section: string; subject: string; slot: string; faculty: string }[] = []
+    const uncoveredEntries: { id: string; date: string; section: string; subject: string; slot: string; faculty: string }[] = []
 
     for (const run of allRuns) {
       const assignments = substitutionAssignmentRepository.findByRunWithRelations(run.id)
@@ -123,6 +136,7 @@ export function Reports() {
       for (const u of uncovered) {
         if (u.originalEntry) {
           uncoveredEntries.push({
+            id: `${run.date}-${u.originalEntry.id}`,
             date: run.date,
             section: u.originalEntry.section?.name || '',
             subject: u.originalEntry.subject?.name || '',
@@ -166,7 +180,7 @@ export function Reports() {
         fs.faculty.name,
         fs.totalSubs,
         fs.totalAbsent,
-        monthlyData.runs.length,
+        fs.servedDays,
       ])
       return {
         title: `${institution} — Monthly Statistics — ${format(new Date(month + '-01T00:00:00'), 'MMMM yyyy')}`,
@@ -425,7 +439,7 @@ export function Reports() {
                     <TableCell className="font-medium">{fs.faculty.name}</TableCell>
                     <TableCell>{fs.totalSubs}</TableCell>
                     <TableCell>{fs.totalAbsent}</TableCell>
-                    <TableCell>{monthlyData.runs.length}</TableCell>
+                    <TableCell>{fs.servedDays}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -482,8 +496,8 @@ export function Reports() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {uncoveredData.map((u, i) => (
-                    <TableRow key={i}>
+                  {uncoveredData.map((u) => (
+                    <TableRow key={u.id}>
                       <TableCell>{format(new Date(u.date + 'T00:00:00'), 'MMM d, yyyy')}</TableCell>
                       <TableCell className="font-medium">{u.section}</TableCell>
                       <TableCell>{u.subject}</TableCell>

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { format } from 'date-fns'
 import { ArrowLeft, ArrowRight, Download, Printer, Table2, Calendar } from 'lucide-react'
@@ -20,6 +20,8 @@ function escapeHtml(value: unknown): string {
 }
 
 interface DisplayRow {
+  /** Stable key: the underlying timetable entry's id. */
+  id: string
   period: string
   section: string
   subject: string
@@ -39,14 +41,29 @@ interface DisplayRow {
 export function RevisedTimetable() {
   const { currentAcademicYear, currentDate, setCurrentDate } = useAppStore()
   const today = currentDate || format(new Date(), 'yyyy-MM-dd')
-  const [error, setError] = useState<string | null>(null)
-
-  const lifecycle = getRunLifecycle(today)
-  const absentIds = useMemo(() => new Set(attendanceRepository.getAbsentFacultyIds(today)), [today])
-  const revised = useMemo(
-    () => (currentAcademicYear ? getRevisedTimetable(today) : []),
-    [currentAcademicYear, today]
-  )
+  // One guarded load: a repository failure (locked or corrupt database, a
+  // section deleted under us) shows the inline error card below instead of
+  // escaping to the app-wide boundary and blanking the whole shell — the
+  // sidebar included.
+  const { lifecycle, absentIds, revised, loadError } = useMemo(() => {
+    try {
+      return {
+        lifecycle: getRunLifecycle(today),
+        absentIds: new Set(attendanceRepository.getAbsentFacultyIds(today)),
+        revised: currentAcademicYear ? getRevisedTimetable(today) : [],
+        loadError: null as string | null,
+      }
+    } catch (e) {
+      console.error(e)
+      return {
+        lifecycle: 'NOT_STARTED' as const,
+        absentIds: new Set<string>(),
+        revised: [] as any[],
+        loadError:
+          'Could not load the revised timetable for this date. Try another date, or reload the app.',
+      }
+    }
+  }, [currentAcademicYear, today])
 
   const dayName = new Date(today + 'T00:00:00').toLocaleDateString('en-US', {
     weekday: 'long',
@@ -71,6 +88,7 @@ export function RevisedTimetable() {
             ? 'Team continues'
             : 'As Scheduled'
       return {
+        id: entry?.id ?? '',
         period: entry
           ? entry.span > 1
             ? timeRangeLabel(entry.timeSlotId, entry.span)
@@ -224,9 +242,9 @@ export function RevisedTimetable() {
         </div>
       </div>
 
-      {error && (
+      {loadError && (
         <div className="p-3 bg-danger-50 border border-danger-200 rounded-lg text-sm text-danger-700">
-          {error}
+          {loadError}
         </div>
       )}
 
@@ -287,7 +305,7 @@ export function RevisedTimetable() {
                 <tbody className="divide-y divide-secondary-100" data-testid="revised-timetable-body">
                   {rows.map((r, i) => (
                     <tr
-                      key={i}
+                      key={r.id || `row-${i}`}
                       className={cn(
                         r.status === 'Substituted' || r.status === 'Locked'
                           ? 'bg-primary-50/50'

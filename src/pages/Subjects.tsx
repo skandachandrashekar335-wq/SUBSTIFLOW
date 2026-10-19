@@ -170,7 +170,7 @@ export function Subjects() {
         <DialogContent className="space-y-4">
           <Input label="Subject Name" value={formData.name} onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))} required />
           <Input label="Code" value={formData.code} onChange={(e) => setFormData(prev => ({ ...prev, code: e.target.value }))} required />
-          <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} required />
+          <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} placeholder="Select department" required />
           <Select label="Default Class Type" value={formData.defaultClassType} onChange={(v) => setFormData(prev => ({ ...prev, defaultClassType: v as ClassType }))} options={classTypeOptions} />
         </DialogContent>
         <DialogFooter>

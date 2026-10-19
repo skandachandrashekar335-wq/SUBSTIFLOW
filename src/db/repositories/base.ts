@@ -1,4 +1,5 @@
 import { getDatabase } from '../database'
+import { withTransaction } from '../transaction'
 
 export interface BaseEntity {
   id: string
@@ -36,23 +37,11 @@ export abstract class BaseRepository<T extends BaseEntity> {
   /**
    * Run `fn` inside a transaction so a multi-statement write can never
    * half-apply (e.g. mappings deleted but their replacements never inserted).
-   * The original error is rethrown after rollback.
+   * The original error is rethrown after rollback. Nesting degrades to a
+   * SAVEPOINT — see `src/db/transaction.ts` for the full contract.
    */
   protected transaction<R>(fn: () => R): R {
-    const db = this.db()
-    db.exec('BEGIN')
-    try {
-      const result = fn()
-      db.exec('COMMIT')
-      return result
-    } catch (error) {
-      try {
-        db.exec('ROLLBACK')
-      } catch {
-        // BEGIN itself may have failed — nothing to roll back.
-      }
-      throw error
-    }
+    return withTransaction(fn)
   }
 
   findAll(): T[] {

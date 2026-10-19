@@ -3,7 +3,8 @@ import { cn } from '@/utils/cn'
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'danger' | 'success' | 'outline' | 'ghost'
-  size?: 'sm' | 'md' | 'lg'
+  /** `icon` = square icon-only action button (36×36, no padding utilities to fight). */
+  size?: 'sm' | 'md' | 'lg' | 'icon'
   loading?: boolean
 }
 
@@ -24,6 +25,15 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       sm: 'px-3 py-1.5 text-xs rounded',
       md: 'px-4 py-2 text-sm rounded-lg',
       lg: 'px-6 py-3 text-base rounded-lg',
+      // Square icon-only action button. It defines its whole box here so
+      // callers never combine `size` with a padding override: Tailwind emits
+      // .px-3/.py-1.5 AFTER .p-0 in the stylesheet, so a caller writing
+      // size="sm" className="h-7 w-7 p-0" silently kept 12px side padding
+      // inside a fixed 28px border-box — leaving a 4px content strip that
+      // crushed the 14px icon to a sliver (invisible action icons).
+      // 36×36px also meets the comfortable hit-target minimum, and shrink-0
+      // keeps it that size inside tight table cells.
+      icon: 'h-9 w-9 p-0 rounded shrink-0',
     }
 
     return (

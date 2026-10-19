@@ -32,3 +32,14 @@ logs/
 *.tmp
 tmp/
 .cache/
+
+# Test / QA artifacts
+coverage/
+test-results/
+playwright-report/
+qa-artifacts/
+*.tsbuildinfo
+
+# Isolated demo environment (created by npm run demo:setup, removed by
+# npm run demo:remove — never contains real college data)
+.substiflow-demo/

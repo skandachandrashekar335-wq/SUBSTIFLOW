@@ -51,21 +51,65 @@ describe('backup import validation', () => {
     if (!result.ok) expect(result.error).toMatch(/not a valid SQLite database/i)
   })
 
-  it('accepts a real SQLite database file', () => {
+  it('rejects a plain SQLite file that is not a SubstiFlow backup', () => {
     const file = path.join(dir, 'real.db')
     const db = new Database(file)
     db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
     db.close()
 
     const result = validateBackupFile(file)
-    expect(result).toEqual({ ok: true })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/not a SubstiFlow backup.*missing/i)
   })
 
-  it('accepts the .sqlite extension for a real database too', () => {
-    const file = path.join(dir, 'real.sqlite')
+  it('accepts a genuine SubstiFlow backup (schema-stamped)', () => {
+    const file = path.join(dir, 'substiflow.sqlite')
     const db = new Database(file)
-    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
+    db.exec(`
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);
+      CREATE TABLE institutions (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE faculty (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE timetable_entries (id TEXT PRIMARY KEY);
+      INSERT INTO schema_version (version, applied_at) VALUES (7, '2026-01-01');
+    `)
     db.close()
     expect(validateBackupFile(file)).toEqual({ ok: true })
+  })
+
+  it('rejects a backup from a NEWER schema version instead of downgrading it', () => {
+    const file = path.join(dir, 'future.db')
+    const db = new Database(file)
+    db.exec(`
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);
+      CREATE TABLE institutions (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE faculty (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE timetable_entries (id TEXT PRIMARY KEY);
+      INSERT INTO schema_version (version, applied_at) VALUES (999, '2099-01-01');
+    `)
+    db.close()
+
+    const result = validateBackupFile(file)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/NEWER version of SubstiFlow/i)
+  })
+
+  it('rejects a file with a valid header but corrupted contents', () => {
+    const file = path.join(dir, 'corrupt.db')
+    const db = new Database(file)
+    db.exec(`
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);
+      CREATE TABLE institutions (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE faculty (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE timetable_entries (id TEXT PRIMARY KEY);
+      INSERT INTO schema_version (version, applied_at) VALUES (7, '2026-01-01');
+    `)
+    db.close()
+    // Truncate mid-page: header still says SQLite, integrity check must fail.
+    const bytes = fs.readFileSync(file)
+    fs.writeFileSync(file, bytes.subarray(0, Math.floor(bytes.length / 2)))
+
+    const result = validateBackupFile(file)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/integrity|could not be opened|corrupt/i)
   })
 })

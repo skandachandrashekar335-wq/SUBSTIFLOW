@@ -23,6 +23,44 @@ export const FACULTY_REQUIRED_CLASS_TYPES: readonly ClassType[] = ['LECTURE', 'L
 /** Configurable policy for partially-absent multi-faculty activities. */
 export type MultiFacultyAbsencePolicy = 'TEAM_SUFFICIENT' | 'REPLACE_ABSENT'
 
+/**
+ * Staff distinction: teaching staff can be scheduled and asked to substitute;
+ * non-teaching staff (officers, lab attendants, …) can never be assigned to a
+ * teaching session nor offered as a substitute. The distinction is per person
+ * in the Faculty page — nothing is inferred from names.
+ */
+export type StaffType = 'TEACHING' | 'NON_TEACHING'
+
+export const STAFF_TYPES: readonly StaffType[] = ['TEACHING', 'NON_TEACHING']
+
+export const STAFF_TYPE_LABELS: Record<StaffType, string> = {
+  TEACHING: 'Teaching staff',
+  NON_TEACHING: 'Non-teaching staff',
+}
+
+/**
+ * How the teachers allocated to a Subject Requirement share its sessions:
+ *
+ *  - AUTO       — the historical rule: a lab with more than one allocated
+ *                 teacher is a TEAM, everything else is ALTERNATE.
+ *  - TEAM       — every allocated teacher teaches every session together
+ *                 (e.g. a lab jointly run by three or five teachers).
+ *  - ALTERNATE  — eligible teachers take separate sessions: exactly one
+ *                 teacher per session.
+ *
+ * Explicitly configurable per requirement (language, specialization, Feature
+ * Engineering, …) — never inferred from a subject's name.
+ */
+export type TeachingArrangement = 'AUTO' | 'TEAM' | 'ALTERNATE'
+
+export const TEACHING_ARRANGEMENTS: readonly TeachingArrangement[] = ['AUTO', 'TEAM', 'ALTERNATE']
+
+export const TEACHING_ARRANGEMENT_LABELS: Record<TeachingArrangement, string> = {
+  AUTO: 'Automatic',
+  TEAM: 'Team — every teacher on every session',
+  ALTERNATE: 'Alternate — one teacher per session',
+}
+
 export type AttendanceStatus = 'PRESENT' | 'ABSENT'
 
 export type SubstitutionStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'LOCKED'
@@ -61,6 +99,8 @@ export interface Faculty {
   employeeId?: string
   departmentId: string
   isActive: boolean
+  /** TEACHING (default) may be scheduled/substituted; NON_TEACHING never is. */
+  staffType: StaffType
   maxDailySubstitutions: number
   priority: number // Lower = higher priority
   notes?: string
@@ -316,4 +356,203 @@ export const CLASS_TYPES: { value: ClassType; label: string }[] = [
 /** Human label for an activity type (falls back to the raw value). */
 export function classTypeLabel(value: string): string {
   return CLASS_TYPES.find((t) => t.value === value)?.label ?? value
+}
+
+// ============================================================================
+// PHASE 1: TEACHING ALLOCATIONS & AUTOMATIC TIMETABLE GENERATION
+// ============================================================================
+
+/** Teaching Allocation — Faculty × Section × Subject × ClassType + weekly session count. */
+export interface TeachingAllocation {
+  id: string
+  academicYearId: string
+  facultyId: string
+  sectionId: string
+  subjectId: string
+  classType: ClassType
+  requiredSessionsPerWeek: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** Teaching Allocation with relations for UI display. */
+export interface TeachingAllocationWithRelations extends TeachingAllocation {
+  faculty?: Faculty
+  section?: Section
+  subject?: Subject
+}
+
+/** Subject Requirement — Section + Subject + ClassType + required weekly sessions + span. */
+export interface SubjectRequirement {
+  id: string
+  academicYearId: string
+  sectionId: string
+  subjectId: string
+  classType: ClassType
+  requiredSessionsPerWeek: number
+  span: number
+  /** How allocated teachers share the sessions (see {@link TeachingArrangement}). */
+  teachingArrangement: TeachingArrangement
+  createdAt: string
+  updatedAt: string
+}
+
+/** Subject Requirement with relations for UI display. */
+export interface SubjectRequirementWithRelations extends SubjectRequirement {
+  section?: Section
+  subject?: Subject
+}
+
+/** Subject Requirement input for create/update. */
+export interface SubjectRequirementInput {
+  academicYearId: string
+  sectionId: string
+  subjectId: string
+  classType: ClassType
+  requiredSessionsPerWeek: number
+  span: number
+  /** Omitted = AUTO (the historical behaviour). */
+  teachingArrangement?: TeachingArrangement
+}
+
+/** Timetable Generation run. */
+export interface TimetableGeneration {
+  id: string
+  academicYearId: string
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+  constraintsSnapshot: Record<string, unknown>
+  diagnosticsSummary?: string
+  createdAt: string
+  updatedAt: string
+  completedAt?: string
+}
+
+/** Draft Timetable Entry — generator output (DRAFT timetable). */
+export interface DraftTimetableEntry {
+  id: string
+  generationId: string
+  academicYearId: string
+  dayOfWeek: DayOfWeek
+  timeSlotId: string
+  sectionId: string
+  subjectId: string
+  classType: ClassType
+  span: number
+  status: 'DRAFT' | 'PUBLISHED'
+  createdAt: string
+  updatedAt: string
+}
+
+/** Draft Timetable Entry with relations. */
+export interface DraftTimetableEntryWithRelations extends DraftTimetableEntry {
+  dayOfWeek: DayOfWeek
+  timeSlot?: TimeSlot
+  section?: Section
+  subject?: Subject
+  facultyList?: Faculty[]
+  roomList?: Room[]
+}
+
+/** Generation Diagnostic — explanation for failed/uncovered activities. */
+export interface GenerationDiagnostic {
+  id: string
+  generationId: string
+  /** The allocation the problem is tied to; null when it is a global/requirement-level problem. */
+  teachingAllocationId: string | null
+  severity: 'ERROR' | 'WARNING' | 'INFO'
+  code: string
+  message: string
+  details?: string
+  createdAt: string
+}
+
+/** Timetable Generation with relations. */
+export interface TimetableGenerationWithRelations extends TimetableGeneration {
+  academicYear?: AcademicYear
+}
+
+/** Teaching Allocation input for create/update. */
+export interface TeachingAllocationInput {
+  academicYearId: string
+  facultyId: string
+  sectionId: string
+  subjectId: string
+  classType: ClassType
+  requiredSessionsPerWeek: number
+}
+
+/** Generation constraints snapshot for reproducibility. */
+export interface GenerationConstraintsSnapshot {
+  timeSlots: TimeSlot[]
+  sections: Section[]
+  faculty: Faculty[]
+  rooms: Room[]
+  teachingAllocations: TeachingAllocation[]
+  workingHours: WorkingHoursConfig
+  multiFacultyAbsencePolicy: MultiFacultyAbsencePolicy
+  maxDailySubstitutions: Record<string, number>
+}
+
+/** Generation status for UI. */
+export type GenerationStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+
+/** Generation diagnostic severity. */
+export type DiagnosticSeverity = 'ERROR' | 'WARNING' | 'INFO'
+
+/** Diagnostic codes for common failure reasons. */
+export enum GenerationDiagnosticCode {
+  NO_QUALIFIED_FACULTY = 'NO_QUALIFIED_FACULTY',
+  FACULTY_CONFLICT = 'FACULTY_CONFLICT',
+  SECTION_CONFLICT = 'SECTION_CONFLICT',
+  ROOM_CONFLICT = 'ROOM_CONFLICT',
+  NO_VALID_WINDOW = 'NO_VALID_WINDOW',
+  SPAN_CROSSES_BREAK = 'SPAN_CROSSES_BREAK',
+  OUTSIDE_WORKING_HOURS = 'OUTSIDE_WORKING_HOURS',
+  LAB_CROSSING_BREAK = 'LAB_CROSSING_BREAK',
+  MULTI_FACULTY_CONFLICT = 'MULTI_FACULTY_CONFLICT',
+  INSUFFICIENT_ROOMS = 'INSUFFICIENT_ROOMS',
+  FACULTY_OVERLOADED = 'FACULTY_OVERLOADED',
+  SECTION_OVERLOADED = 'SECTION_OVERLOADED',
+  INSUFFICIENT_QUALIFIED_FACULTY_FOR_LAB = 'INSUFFICIENT_QUALIFIED_FACULTY_FOR_LAB',
+  CONSTRAINT_UNSATISFIABLE = 'CONSTRAINT_UNSATISFIABLE',
+  /** Configuration problem detected before any search was attempted. */
+  INPUT_INVALID = 'INPUT_INVALID',
+  /** Attempt or time limit reached — the search did not exhaust the space. */
+  SEARCH_LIMIT_REACHED = 'SEARCH_LIMIT_REACHED',
+}
+
+/** Generation result. */
+export interface GenerationResult {
+  generationId: string
+  status: GenerationStatus
+  assignments: DraftTimetableEntry[]
+  diagnostics: GenerationDiagnostic[]
+  statistics: {
+    totalAllocations: number
+    scheduled: number
+    uncovered: number
+    errors: number
+    warnings: number
+    /** Weekly lab sessions among the scheduled assignments. */
+    labs?: number
+  }
+  diagnosticsSummary?: string
+  /** Search effort actually spent (bounds come from app settings). */
+  search?: {
+    attempts: number
+    elapsedMs: number
+    limitAttempts: number
+    limitTimeoutMs: number
+    stopReason: 'attempts' | 'timeout' | 'exhausted' | null
+  }
+}
+
+/** Draft timetable entry with faculty/room relations. */
+export interface DraftTimetableEntryWithRelations extends DraftTimetableEntry {
+  dayOfWeek: DayOfWeek
+  timeSlot?: TimeSlot
+  section?: Section
+  subject?: Subject
+  facultyList?: Faculty[]
+  roomList?: Room[]
 }

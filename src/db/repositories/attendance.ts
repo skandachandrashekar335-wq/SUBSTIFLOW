@@ -1,4 +1,5 @@
 import { getDatabase } from '../database'
+import { withTransaction } from '../transaction'
 import { BaseRepository } from './base'
 import { Attendance, AttendanceStatus } from '@/types'
 
@@ -60,9 +61,13 @@ export class AttendanceRepository extends BaseRepository<Attendance> {
       VALUES (?, ?, ?, 'PRESENT', '', datetime('now'), datetime('now'))
       ON CONFLICT(date, faculty_id) DO UPDATE SET status = 'PRESENT'
     `)
-    for (const facultyId of facultyIds) {
-      stmt.run(crypto.randomUUID(), date, facultyId)
-    }
+    // One transaction: a failure half-way (disk full, constraint) must not
+    // leave half the batch marked present.
+    withTransaction(() => {
+      for (const facultyId of facultyIds) {
+        stmt.run(crypto.randomUUID(), date, facultyId)
+      }
+    })
   }
 }
 

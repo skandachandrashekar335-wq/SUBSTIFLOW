@@ -12,6 +12,8 @@ export const AUDIT_ACTIONS = {
   SUBSTITUTION_LOCKED: 'substitution.locked',
   SUBSTITUTION_UNLOCKED: 'substitution.unlocked',
   SUBSTITUTION_APPROVED: 'substitution.approved',
+  /** A timetable generation run (draft) was deleted; published timetable untouched. */
+  GENERATION_DELETED: 'generation.deleted',
 } as const
 
 /**

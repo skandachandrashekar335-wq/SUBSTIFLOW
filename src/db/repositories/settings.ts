@@ -1,4 +1,5 @@
 import { BaseRepository } from './base'
+import { withTransaction } from '../transaction'
 import { ApplicationSettings, DAYS_OF_WEEK, DayOfWeek, MultiFacultyAbsencePolicy } from '@/types'
 
 export class SettingsRepository extends BaseRepository<ApplicationSettings> {
@@ -72,10 +73,14 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
   }
 
   setWorkingHours(config: { startTime: string; endTime: string; breakStart: string; breakEnd: string }): void {
-    this.set('working_hours_start', config.startTime, 'Working hours start time')
-    this.set('working_hours_end', config.endTime, 'Working hours end time')
-    this.set('break_start', config.breakStart, 'Break start time')
-    this.set('break_end', config.breakEnd, 'Break end time')
+    // One transaction: four independent writes must land together, never as
+    // a half-updated working-hours configuration.
+    withTransaction(() => {
+      this.set('working_hours_start', config.startTime, 'Working hours start time')
+      this.set('working_hours_end', config.endTime, 'Working hours end time')
+      this.set('break_start', config.breakStart, 'Break start time')
+      this.set('break_end', config.breakEnd, 'Break end time')
+    })
   }
 
   /**
@@ -192,6 +197,56 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
 
   setInstitutionAddress(address: string): void {
     this.set('institution_address', address, 'Institution address')
+  }
+
+  /**
+   * Generation search bound — maximum number of placement attempts the
+   * timetable solver may make before giving up (seeded by migration 4).
+   */
+  getMaxGenerationAttempts(): number {
+    const parsed = parseInt(this.get('max_generation_attempts') || '1000', 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000
+  }
+
+  setMaxGenerationAttempts(value: number): void {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error('Maximum generation attempts must be a positive whole number.')
+    }
+    this.set(
+      'max_generation_attempts',
+      value.toString(),
+      'Maximum number of placement attempts per activity during timetable generation.'
+    )
+  }
+
+  /** Wall-clock budget for one generation run, in milliseconds. */
+  getGenerationTimeoutMs(): number {
+    const parsed = parseInt(this.get('generation_timeout_ms') || '30000', 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000
+  }
+
+  setGenerationTimeoutMs(value: number): void {
+    if (!Number.isInteger(value) || value < 100) {
+      throw new Error('Generation timeout must be a whole number of milliseconds (at least 100).')
+    }
+    this.set(
+      'generation_timeout_ms',
+      value.toString(),
+      'Maximum time in milliseconds to spend on a single generation run.'
+    )
+  }
+
+  /** Soft preference: spread a subject's weekly sessions across days. */
+  getPreferSpread(): boolean {
+    return this.get('prefer_spread') !== 'false'
+  }
+
+  setPreferSpread(value: boolean): void {
+    this.set(
+      'prefer_spread',
+      value ? 'true' : 'false',
+      'When true, the generator tries to spread sessions across the week rather than cluster them.'
+    )
   }
 
   isSetupComplete(): boolean {

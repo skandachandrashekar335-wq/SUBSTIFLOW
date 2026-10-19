@@ -23,6 +23,7 @@ export { findAffectedEntries } from './engine'
 import { isOutsideWorkingHours, isUnrelatedToEntry } from './scoring'
 import { coveredSlotsOf } from '@/services/timetable'
 import { getDatabase } from '@/db/database'
+import { withTransaction } from '@/db/transaction'
 import { UncoveredEntry } from './types'
 
 export interface SubstitutionResult {
@@ -76,6 +77,22 @@ export function generateSubstitutions(date: string): SubstitutionResult {
 }
 
 /**
+ * ONE definition of coverage for every surface (Planner, Dashboard,
+ * Reports): a class is covered when its assignment row has a substitute and
+ * the assignment was not REJECTED (an explicit rejection frees the slot and
+ * stops counting as coverage). Uncovered is what remains of the AFFECTED
+ * set — never the raw count of substitute-less rows, which could exceed the
+ * affected count (negative "uncovered" in reports) once stale rows existed.
+ */
+export function computeCoverage(
+  totalAffected: number,
+  rows: Array<{ substituteFacultyId?: string | null; status: string }>
+): { covered: number; uncovered: number } {
+  const covered = rows.filter((a) => a.substituteFacultyId && a.status !== 'REJECTED').length
+  return { covered, uncovered: Math.max(0, totalAffected - covered) }
+}
+
+/**
  * Get substitution run for a date
  */
 export function getSubstitutionRun(date: string): SubstitutionResult | null {
@@ -108,6 +125,8 @@ export function getSubstitutionRun(date: string): SubstitutionResult | null {
       attemptedCandidates: [],
     }))
 
+  const coverage = computeCoverage(affectedEntries.length, assignments)
+
   return {
     runId: run.id,
     date: run.date,
@@ -119,15 +138,23 @@ export function getSubstitutionRun(date: string): SubstitutionResult | null {
     affectedEntries,
     statistics: {
       totalAffected: affectedEntries.length,
-      covered: assignments.filter(a => a.substituteFacultyId).length,
-      uncovered: uncovered.length,
+      covered: coverage.covered,
+      uncovered: coverage.uncovered,
       manuallyAssigned: assignments.filter(a => a.status === 'LOCKED').length,
     },
   }
 }
 
 /**
- * Approve substitution run
+ * Approve substitution run.
+ *
+ * Product decision: approving a plan that still has UNCOVERED classes is
+ * allowed — the coordinator may have arranged those covers outside the app —
+ * but the Planner UI never approves silently: with uncovered classes it
+ * requires an explicit confirmation that names the count. The service layer
+ * deliberately does not repeat that gate (it cannot see UI intent); what it
+ * does guarantee is that every approval lands on a run that actually exists
+ * and is recorded in the audit log with the approver's name.
  */
 export function approveSubstitutionRun(date: string, approvedBy: string): SubstitutionRun | null {
   const run = substitutionRunRepository.findByDate(date)
@@ -181,6 +208,9 @@ export function validateSubstitute(slot: SubstituteSlot, facultyId: string): Sub
   const faculty = facultyRepository.findById(facultyId)
   if (!faculty) return { ok: false, reason: 'That faculty member no longer exists.' }
   if (!faculty.isActive) return { ok: false, reason: `${faculty.name} is inactive.` }
+  if (faculty.staffType === 'NON_TEACHING') {
+    return { ok: false, reason: `${faculty.name} is non-teaching staff and cannot cover classes.` }
+  }
   if (slot.isBreak) return { ok: false, reason: 'Classes cannot be substituted during the break.' }
 
   // Hard constraint (e): periods outside the configured working hours can
@@ -285,7 +315,13 @@ export function validateSubstitute(slot: SubstituteSlot, facultyId: string): Sub
   `).all(slot.date, facultyId) as { id: string }[]
 
   const count = assigned.filter((row) => row.id !== slot.excludeAssignmentId).length
-  const limit = faculty.maxDailySubstitutions ?? 0
+  // Same rule as generation: the personal limit and the institution-wide
+  // setting both apply; the stricter one wins. (The global default is 2 —
+  // see DEFAULT_MAX_DAILY_SUBSTITUTIONS.)
+  const limit = Math.min(
+    faculty.maxDailySubstitutions ?? 0,
+    settingsRepository.getMaxDailySubstitutions()
+  )
   if (count >= limit) {
     return { ok: false, reason: `${faculty.name} is already at the daily limit of ${limit} substitution(s).` }
   }
@@ -418,30 +454,41 @@ export function updateSubstitutionAssignment(
   }
 
   const previous = substitutionAssignmentRepository.findById(assignmentId)
-  const updated = substitutionAssignmentRepository.update(assignmentId, normalized as any)
+  // One transaction for the whole override: the assignment update, the run
+  // reopening that must outlive it, and the audit row are a single logical
+  // change — a failure between them must never leave an APPROVED badge
+  // describing a plan that already changed (or an audit trail claiming a
+  // change that was rolled back).
+  let updated: any = null
+  withTransaction(() => {
+    updated = substitutionAssignmentRepository.update(assignmentId, normalized as any)
+    if (!updated) return
+    if (previous) reopenApprovedRun(previous.runId)
+
+    // Audit only REAL coordinator changes: this service function is never
+    // called by the generator (it writes through the repository directly).
+    if ('substituteFacultyId' in normalized) {
+      const runForAudit = substitutionRunRepository.findById(updated.runId)
+      if (runForAudit) {
+        const name = normalized.substituteFacultyId
+          ? facultyRepository.findById(normalized.substituteFacultyId)?.name ?? 'a faculty member'
+          : null
+        auditLogRepository.record(
+          AUDIT_ACTIONS.SUBSTITUTION_OVERRIDE,
+          'substitution_assignment',
+          assignmentId,
+          name
+            ? `${runForAudit.date}: substitute manually set to ${name}`
+            : `${runForAudit.date}: substitute removed (class uncovered)`
+        )
+      }
+    }
+  })
   if (!updated) return null
-  
-  if (previous) reopenApprovedRun(previous.runId)
 
   const run = substitutionRunRepository.findById(updated.runId)
   if (!run) return null
 
-  // Audit only REAL coordinator changes: this service function is never
-  // called by the generator (it writes through the repository directly).
-  if ('substituteFacultyId' in normalized) {
-    const name = normalized.substituteFacultyId
-      ? facultyRepository.findById(normalized.substituteFacultyId)?.name ?? 'a faculty member'
-      : null
-    auditLogRepository.record(
-      AUDIT_ACTIONS.SUBSTITUTION_OVERRIDE,
-      'substitution_assignment',
-      assignmentId,
-      name
-        ? `${run.date}: substitute manually set to ${name}`
-        : `${run.date}: substitute removed (class uncovered)`
-    )
-  }
-  
   return substitutionAssignmentRepository.findByRunWithRelations(run.id).find(a => a.id === assignmentId) || null
 }
 
@@ -547,21 +594,12 @@ export function deleteSubstitutionRun(date: string): boolean {
 
   // Atomic: never leave an empty run row behind (orphan run with its
   // assignments already gone) if the second statement fails.
-  const db = getDatabase()
-  db.exec('BEGIN')
-  try {
+  let removed = false
+  withTransaction(() => {
     substitutionAssignmentRepository.deleteByRun(run.id)
-    const removed = substitutionRunRepository.delete(run.id)
-    db.exec('COMMIT')
-    return removed
-  } catch (error) {
-    try {
-      db.exec('ROLLBACK')
-    } catch {
-      // BEGIN never landed — nothing to roll back.
-    }
-    throw error
-  }
+    removed = substitutionRunRepository.delete(run.id)
+  })
+  return removed
 }
 
 // ---------------------------------------------------------------------------

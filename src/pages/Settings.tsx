@@ -8,6 +8,7 @@ import { Checkbox } from '@/components/ui/Checkbox'
 import { Dialog, DialogHeader, DialogContent, DialogFooter } from '@/components/ui/Dialog'
 import { useAppStore } from '@/stores/appStore'
 import { settingsRepository, academicYearRepository, departmentRepository, timeSlotRepository, termRepository } from '@/db/repositories'
+import { withTransaction } from '@/db/transaction'
 import { SubstitutionWeights, DEFAULT_SUBSTITUTION_WEIGHTS, AcademicYear, Department, TimeSlot, DayOfWeek, DAYS_OF_WEEK, MultiFacultyAbsencePolicy } from '@/types'
 import { cn } from '@/utils/cn'
 
@@ -64,6 +65,8 @@ export function Settings() {
   const [showYearForm, setShowYearForm] = useState(false)
   const [editingYear, setEditingYear] = useState<AcademicYear | null>(null)
   const [yearForm, setYearForm] = useState({ name: '', startDate: '', endDate: '' })
+  const [showTermForm, setShowTermForm] = useState(false)
+  const [termForm, setTermForm] = useState({ name: '', startDate: '', endDate: '' })
 
   const [departments, setDepartments] = useState<Department[]>([])
   const [showDeptForm, setShowDeptForm] = useState(false)
@@ -128,8 +131,15 @@ export function Settings() {
   }
 
   const saveGeneral = () => {
+    const name = institutionName.trim()
+    // The name appears on every report/export title — refuse to save an
+    // empty one instead of silently substituting a generic "College".
+    if (!name) {
+      alert('Institution name cannot be empty — it appears on every export.')
+      return
+    }
     try {
-      settingsRepository.setInstitutionName(institutionName.trim() || 'College')
+      settingsRepository.setInstitutionName(name)
       settingsRepository.setInstitutionAddress(institutionAddress.trim())
       showSaved()
     } catch (error) {
@@ -207,9 +217,12 @@ export function Settings() {
       parsed[key] = value
     }
     try {
-      settingsRepository.setSubstitutionWeights(parsed)
-      settingsRepository.setAllowUnrelatedSubstitutions(allowUnrelatedDraft)
-      settingsRepository.setMultiFacultyAbsencePolicy(policyDraft)
+      // Three related rule settings: land together or not at all.
+      withTransaction(() => {
+        settingsRepository.setSubstitutionWeights(parsed)
+        settingsRepository.setAllowUnrelatedSubstitutions(allowUnrelatedDraft)
+        settingsRepository.setMultiFacultyAbsencePolicy(policyDraft)
+      })
       setRulesError(null)
       showSaved()
     } catch (error) {
@@ -306,6 +319,38 @@ export function Settings() {
       setAcademicYears(academicYearRepository.findAll())
     } catch (error) {
       alert(friendlyMessage(error, 'Could not save the academic year. Please try again.'))
+    }
+  }
+
+  /**
+   * Edit the active term. Before this existed the term card was read-only,
+   * so once today slipped past the end date the app said "Outside term"
+   * forever with no way to roll the window forward short of raw SQL.
+   */
+  const handleSaveTerm = () => {
+    const term = termRepository.getActive()
+    if (!term) return
+    if (!termForm.name.trim() || !termForm.startDate || !termForm.endDate) {
+      alert('Please fill all fields')
+      return
+    }
+    if (termForm.endDate < termForm.startDate) {
+      alert('End date must be on or after start date')
+      return
+    }
+    try {
+      termRepository.update(term.id, {
+        name: termForm.name.trim(),
+        startDate: termForm.startDate,
+        endDate: termForm.endDate,
+      })
+      setShowTermForm(false)
+      setTermForm({ name: '', startDate: '', endDate: '' })
+      // The term card is read fresh on every render — closing the dialog
+      // re-renders it with the new window.
+      showSaved()
+    } catch (error) {
+      alert(friendlyMessage(error, 'Could not save the term. Please try again.'))
     }
   }
 
@@ -616,9 +661,21 @@ export function Settings() {
                       {term.startDate} to {term.endDate} · answers “which timetable is effective today?” for the {new Date().getFullYear()} calendar
                     </p>
                   </div>
-                  <span className={inTerm ? 'badge bg-primary-100 text-primary-700' : 'badge bg-warning-100 text-warning-700'}>
-                    {inTerm ? 'IN TERM' : 'OUTSIDE TERM'}
-                  </span>
+                  <div className="flex items-center gap-3">
+                    <span className={inTerm ? 'badge bg-primary-100 text-primary-700' : 'badge bg-warning-100 text-warning-700'}>
+                      {inTerm ? 'IN TERM' : 'OUTSIDE TERM'}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setTermForm({ name: term.name, startDate: term.startDate, endDate: term.endDate })
+                        setShowTermForm(true)
+                      }}
+                    >
+                      Edit
+                    </Button>
+                  </div>
                 </CardBody>
               </Card>
             )
@@ -808,6 +865,24 @@ export function Settings() {
         <DialogFooter>
           <Button variant="secondary" onClick={() => { setShowYearForm(false); setEditingYear(null); }}>Cancel</Button>
           <Button onClick={handleSaveYear}>{editingYear ? 'Update' : 'Create'}</Button>
+        </DialogFooter>
+      </Dialog>
+
+      <Dialog open={showTermForm} onOpenChange={setShowTermForm}>
+        <DialogHeader title="Edit Term (timetable validity)" />
+        <DialogContent className="space-y-4">
+          <Input label="Term Name" value={termForm.name} onChange={(e) => setTermForm(prev => ({ ...prev, name: e.target.value }))} placeholder="e.g., Term 1 2026" required />
+          <div className="grid grid-cols-2 gap-4">
+            <Input label="Start Date" type="date" value={termForm.startDate} onChange={(e) => setTermForm(prev => ({ ...prev, startDate: e.target.value }))} required />
+            <Input label="End Date" type="date" value={termForm.endDate} onChange={(e) => setTermForm(prev => ({ ...prev, endDate: e.target.value }))} required />
+          </div>
+          <p className="text-sm text-secondary-500">
+            The term window decides which timetable is “effective today”. Extend the end date when a new term begins.
+          </p>
+        </DialogContent>
+        <DialogFooter>
+          <Button variant="secondary" onClick={() => setShowTermForm(false)}>Cancel</Button>
+          <Button onClick={handleSaveTerm}>Update</Button>
         </DialogFooter>
       </Dialog>
 

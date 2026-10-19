@@ -12,6 +12,7 @@ export class FacultyRepository extends BaseRepository<Faculty> {
       employeeId: row.employee_id,
       departmentId: row.department_id,
       isActive: Boolean(row.is_active),
+      staffType: (row.staff_type as Faculty['staffType']) ?? 'TEACHING',
       maxDailySubstitutions: row.max_daily_substitutions,
       priority: row.priority,
       notes: row.notes,
@@ -101,12 +102,23 @@ export class FacultyRepository extends BaseRepository<Faculty> {
     })
   }
 
+  /**
+   * How many substitutions this faculty member has taken on `date`.
+   *
+   * ONE counting rule for every surface (generation, manual picker,
+   * Dashboard): every assignment row with this faculty as the substitute
+   * counts — PENDING, APPROVED and LOCKED all reserve a daily slot; only an
+   * explicit REJECTED frees it. (Generation previously counted only
+   * APPROVED/LOCKED while the manual picker counted everything but
+   * REJECTED, so the same person/date could pass the limit on one surface
+   * and fail it on the other.)
+   */
   getDailySubstitutionCount(facultyId: string, date: string): number {
     const row = this.db().prepare(`
       SELECT COUNT(*) as count
       FROM substitution_assignments sa
       JOIN substitution_runs sr ON sa.run_id = sr.id
-      WHERE sa.substitute_faculty_id = ? AND sr.date = ? AND sa.status IN ('APPROVED', 'LOCKED')
+      WHERE sa.substitute_faculty_id = ? AND sr.date = ? AND sa.status <> 'REJECTED'
     `).get(facultyId, date) as { count: number }
     return row.count
   }

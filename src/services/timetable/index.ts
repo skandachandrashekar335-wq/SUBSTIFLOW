@@ -20,10 +20,12 @@
  * developer console.
  */
 import { timetableEntryRepository } from '@/db/repositories/timetableEntry'
+import { withTransaction } from '@/db/transaction'
 import { timeSlotRepository } from '@/db/repositories/timeSlot'
 import { facultyRepository } from '@/db/repositories/faculty'
 import { sectionRepository } from '@/db/repositories/section'
 import { subjectRepository } from '@/db/repositories/subject'
+import { settingsRepository } from '@/db/repositories/settings'
 import { auditLogRepository, AUDIT_ACTIONS } from '@/db/repositories/auditLog'
 import {
   CLASS_TYPES,
@@ -255,6 +257,76 @@ export function validateTimetableEntryInput(
   }
   if (new Set(roomIds).size !== roomIds.length) {
     errors.push('Each room can only be added once.')
+  }
+
+  // Active + TEACHING: non-teaching staff can never appear on a timetable —
+  // the same hard rule the generator's input gate and the draft validator
+  // enforce. (The faculty dropdown only offers active teaching staff, but a
+  // stale selection can be saved after someone is deactivated or moved to
+  // NON_TEACHING.)
+  for (const facultyId of facultyIds) {
+    const faculty = facultyRepository.findById(facultyId)
+    if (!faculty) {
+      errors.push('A selected faculty member no longer exists. Reload the page.')
+    } else if (!faculty.isActive) {
+      errors.push(`${faculty.name} is inactive and cannot be scheduled.`)
+    } else if (faculty.staffType === 'NON_TEACHING') {
+      errors.push(`${faculty.name} is non-teaching staff and can never be scheduled.`)
+    }
+  }
+
+  // Configured working days and working hours — the SAME rules the draft
+  // validator enforces for generated timetables. Previously a manual entry
+  // could land on a non-working day or outside working hours, producing a
+  // master timetable that validateDraftTimetable would have rejected.
+  const minutes = (time: string) =>
+    /^\d{2}:\d{2}$/.test(time) ? Number(time.slice(0, 2)) * 60 + Number(time.slice(3, 5)) : NaN
+
+  if (input.dayOfWeek) {
+    const workingDays = new Set<string>(settingsRepository.getWorkingDays())
+    if (!workingDays.has(input.dayOfWeek)) {
+      errors.push(`${input.dayOfWeek} is not a configured working day (see Settings).`)
+    }
+  }
+
+  if (input.timeSlotId && timeSlotRepository.findById(input.timeSlotId) && Number.isInteger(span) && span >= 1) {
+    const covered = resolveCoveredSlots(input.timeSlotId, span)
+    if (!('error' in covered)) {
+      const startSlot = timeSlotRepository.findById(input.timeSlotId)!
+      const hours = settingsRepository.getWorkingHours()
+      const breakStart = minutes(hours.breakStart)
+      const breakEnd = minutes(hours.breakEnd)
+
+      for (const s of covered.slots) {
+        const crossesBreak =
+          s.isBreak ||
+          (Number.isFinite(breakStart) &&
+            Number.isFinite(breakEnd) &&
+            minutes(s.startTime) < breakEnd &&
+            minutes(s.endTime) > breakStart)
+        if (crossesBreak) {
+          errors.push(
+            `The selected periods cross the break (${hours.breakStart}–${hours.breakEnd}); sessions must never span the break.`
+          )
+          break
+        }
+      }
+
+      const startMin = minutes(startSlot.startTime)
+      const lastSlot = covered.slots[covered.slots.length - 1]
+      const endMin = minutes(lastSlot.endTime)
+      const openMin = minutes(hours.startTime)
+      const closeMin = minutes(hours.endTime)
+      if (
+        Number.isFinite(startMin) && Number.isFinite(endMin) &&
+        Number.isFinite(openMin) && Number.isFinite(closeMin) &&
+        (startMin < openMin || endMin > closeMin)
+      ) {
+        errors.push(
+          `The selected periods lie outside the configured working hours (${hours.startTime}–${hours.endTime}).`
+        )
+      }
+    }
   }
 
   // Faculty↔subject pairing: EVERY member of the teaching team must be
@@ -492,6 +564,30 @@ export function deleteTimetableEntry(id: string): void {
   } catch (error) {
     throw toFriendlyError(error, 'Could not delete the timetable entry. Please try again.')
   }
+}
+
+/**
+ * Coordinator picked "Replace Existing" on a conflict: the clashing entries
+ * (and their substitution history) are removed and the new entry saved —
+ * ATOMICALLY. If the save fails for any reason (a newly discovered clash,
+ * an FK refusal, a validation change), every deletion is rolled back, so a
+ * failed replace can never destroy existing entries without storing their
+ * replacement. All-or-nothing is provided by `withTransaction`, which
+ * degrades to a SAVEPOINT when nested inside the publish transaction.
+ */
+export function replaceTimetableEntries(removedEntryIds: string[], save: () => void): void {
+  withTransaction(() => {
+    for (const id of removedEntryIds) {
+      // A duplicate conflict on the same entry must not abort the replace —
+      // the save step re-validates everything anyway.
+      try {
+        deleteTimetableEntry(id)
+      } catch (error) {
+        if (!/no longer exists/i.test(String((error as Error)?.message ?? error))) throw error
+      }
+    }
+    save()
+  })
 }
 
 // ---------------------------------------------------------------------------

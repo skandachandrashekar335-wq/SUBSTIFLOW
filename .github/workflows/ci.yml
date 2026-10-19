@@ -1,0 +1,41 @@
+name: CI
+
+# Minimal release-readiness pipeline: clean install from the lockfile,
+# unit tests, both TypeScript checks, and the production build.
+#
+# Runner: macos-latest — the platform this repository is developed and
+# verified on (the postinstall hook applies a macOS ad-hoc code signature and
+# stamps native module ABIs; tests and builds were validated on macOS only).
+#
+# The Playwright Electron E2E suite (`npm run e2e`) is deliberately NOT run
+# here: it launches a real GUI application window and has not been validated
+# on hosted runners. Run it locally, where it is verified green.
+
+on: [push, pull_request]
+
+jobs:
+  verify:
+    name: Install, test, typecheck, build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Clean install from lockfile
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Typecheck (renderer)
+        run: npx tsc --noEmit
+
+      - name: Typecheck (Electron main)
+        run: npx tsc -p tsconfig.electron.json --noEmit
+
+      - name: Production build
+        run: npm run build

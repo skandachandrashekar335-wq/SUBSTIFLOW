@@ -270,6 +270,85 @@ describe('migration v1 → current', () => {
     expect(row.id).toBeTruthy() // id stamped so every future save lands too
   })
 
+  it('v7 adds the staff/arrangement columns and backfills legacy NULL audit ids', () => {
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+
+    // Legacy audit rows exactly as the old build wrote them: no id at all.
+    // (On production these surfaced as duplicate React keys in the Dashboard's
+    // Recent Activity list, because the list keys on `audit_log.id`.)
+    const insert = testDb!.prepare(
+      `INSERT INTO audit_log (action, entity_type, detail, created_at, updated_at)
+       VALUES ('timetable.deleted', 'timetable_entry', 'legacy row', datetime('now'), datetime('now'))`
+    )
+    insert.run()
+    insert.run()
+    expect(
+      (testDb!.prepare('SELECT COUNT(*) c FROM audit_log WHERE id IS NULL').get() as { c: number }).c
+    ).toBe(2)
+
+    // Behave like a pre-v7 database on the next launch: rewind the stamp
+    // past every version >= 7 so the next runMigrations replays them.
+    testDb!.prepare('DELETE FROM schema_version WHERE version >= 7').run()
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+
+    // Every id is now a unique non-null primary key; no row was lost.
+    expect(
+      (testDb!.prepare('SELECT COUNT(*) c FROM audit_log WHERE id IS NULL').get() as { c: number }).c
+    ).toBe(0)
+    expect(
+      (testDb!.prepare('SELECT COUNT(DISTINCT id) c FROM audit_log').get() as { c: number }).c
+    ).toBe(
+      (testDb!.prepare('SELECT COUNT(*) c FROM audit_log').get() as { c: number }).c
+    )
+    expect(
+      (testDb!.prepare("SELECT COUNT(*) c FROM audit_log WHERE detail = 'legacy row'").get() as { c: number }).c
+    ).toBe(2)
+
+    // faculty.staff_type: legacy rows default to TEACHING, and the CHECK holds.
+    const facultyCols = testDb!.prepare('PRAGMA table_info(faculty)').all() as { name: string }[]
+    expect(facultyCols.some((c) => c.name === 'staff_type')).toBe(true)
+    expect(
+      testDb!.prepare("SELECT staff_type FROM faculty WHERE id = 'fac-1'").get() as { staff_type: string }
+    ).toMatchObject({ staff_type: 'TEACHING' })
+    expect(() => testDb!.prepare("UPDATE faculty SET staff_type = 'BOGUS' WHERE id = 'fac-1'").run()).toThrow(
+      /CHECK/i
+    )
+
+    // subject_requirements.teaching_arrangement: default AUTO, CHECK holds.
+    const reqCols = testDb!.prepare('PRAGMA table_info(subject_requirements)').all() as { name: string }[]
+    expect(reqCols.some((c) => c.name === 'teaching_arrangement')).toBe(true)
+    testDb!
+      .prepare(
+        `INSERT INTO subject_requirements (id, academic_year_id, section_id, subject_id, class_type, required_sessions_per_week, span)
+         SELECT 'req-v7', 'year-old', 'sec-a', 'sub-1', 'LECTURE', 1, 1`
+      )
+      .run()
+    expect(
+      testDb!.prepare("SELECT teaching_arrangement FROM subject_requirements WHERE id = 'req-v7'").get() as {
+        teaching_arrangement: string
+      }
+    ).toMatchObject({ teaching_arrangement: 'AUTO' })
+    expect(() =>
+      testDb!
+        .prepare(
+          `INSERT INTO subject_requirements (id, academic_year_id, section_id, subject_id, class_type, required_sessions_per_week, span, teaching_arrangement)
+           VALUES ('req-bad', 'year-old', 'sec-a', 'sub-1', 'LECTURE', 1, 1, 'BOGUS')`
+        )
+        .run()
+    ).toThrow(/CHECK/i)
+
+    // Stamped, referentially clean, idempotent.
+    expect(
+      (testDb!.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number }).v
+    ).toBe(TARGET_SCHEMA_VERSION)
+    expect(testDb!.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0)
+    const auditTotal = (testDb!.prepare('SELECT COUNT(*) c FROM audit_log').get() as { c: number }).c
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+    expect(
+      (testDb!.prepare('SELECT COUNT(*) c FROM audit_log').get() as { c: number }).c
+    ).toBe(auditTotal) // idempotent — nothing duplicated or double-stamped
+  })
+
   it('is idempotent — a second launch applies nothing', () => {
     runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
     const snapshot = JSON.stringify(
@@ -303,5 +382,79 @@ describe('migration v1 → current', () => {
     expect(
       (testDb!.prepare('SELECT COUNT(*) c FROM audit_log').get() as { c: number }).c
     ).toBe(1)
+  })
+
+  it('replays migration 2 safely after a commit/stamp crash (guard, no rebuild)', () => {
+    // Real scenario: v2's transaction commits, then the process dies before
+    // the schema_version stamp lands. The next launch re-runs v2 against an
+    // already-migrated schema — which used to fail forever (the rebuild
+    // copies from columns it had already dropped).
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+    const entriesBefore = (testDb!.prepare('SELECT COUNT(*) c FROM timetable_entries').get() as { c: number }).c
+    const joinBefore = (testDb!.prepare('SELECT COUNT(*) c FROM timetable_entry_faculty').get() as { c: number }).c
+
+    // Stamp says "v2 never ran" even though its work committed.
+    testDb!.prepare('DELETE FROM schema_version WHERE version >= 2').run()
+
+    expect(() =>
+      runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+    ).not.toThrow()
+
+    expect(
+      (testDb!.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number }).v
+    ).toBe(TARGET_SCHEMA_VERSION)
+    // The guarded no-op rebuilt nothing: no lost rows, no duplicated join rows.
+    expect(
+      (testDb!.prepare('SELECT COUNT(*) c FROM timetable_entries').get() as { c: number }).c
+    ).toBe(entriesBefore)
+    expect(
+      (testDb!.prepare('SELECT COUNT(*) c FROM timetable_entry_faculty').get() as { c: number }).c
+    ).toBe(joinBefore)
+    expect(testDb!.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0)
+  })
+
+  it('v8: an upgraded database carries the same updated_at triggers as a fresh install', () => {
+    // Upgraded path: v1 -> current through every migration.
+    runMigrations(testDb as unknown as Parameters<typeof runMigrations>[0])
+    const upgradedTriggers = new Set(
+      (testDb!.prepare("SELECT name FROM sqlite_master WHERE type='trigger'").all() as {
+        name: string
+      }[]).map((r) => r.name)
+    )
+
+    // Fresh-install path: an empty database goes through first-init (schema.sql).
+    const fresh = new Database(':memory:')
+    runMigrations(fresh as unknown as Parameters<typeof runMigrations>[0])
+    const freshTriggers = (
+      fresh.prepare("SELECT name FROM sqlite_master WHERE type='trigger'").all() as {
+        name: string
+      }[]
+    ).map((r) => r.name)
+    fresh.close()
+
+    expect(freshTriggers.length).toBe(18)
+
+    // Every fresh-install trigger must also exist after migration — for every
+    // table the migrated database actually has (the v1 fixture here is a
+    // reduced subset of the real legacy schema). No rogue triggers either.
+    const upgradedTables = new Set(
+      (testDb!.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
+        name: string
+      }[]).map((r) => r.name)
+    )
+    for (const trigger of freshTriggers) {
+      const table = trigger.replace(/^update_/, '').replace(/_updated_at$/, '')
+      if (!upgradedTables.has(table)) continue
+      expect(upgradedTriggers.has(trigger), `missing trigger ${trigger} after upgrade`).toBe(true)
+    }
+    for (const trigger of upgradedTriggers) {
+      expect(freshTriggers, `rogue trigger ${trigger} on upgraded database`).toContain(trigger)
+    }
+
+    // The previously-drifted base tables (never created by any migration
+    // before v8) must carry their triggers after the upgrade.
+    for (const t of ['faculty', 'subjects', 'sections', 'rooms', 'academic_years', 'application_settings']) {
+      expect(upgradedTriggers.has(`update_${t}_updated_at`)).toBe(true)
+    }
   })
 })

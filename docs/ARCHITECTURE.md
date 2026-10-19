@@ -89,7 +89,7 @@ Both run the same forward-only migrations on open, so every environment converge
 
 ## Concurrency and data integrity
 
-- SQLite runs in WAL mode with foreign keys enforced; multi-statement operations are wrapped in transactions (`db:transaction` IPC, repository-level helpers) so a crash mid-operation cannot leave half a plan behind.
+- SQLite runs in WAL mode with foreign keys enforced; multi-statement operations are wrapped in transactions (the shared `withTransaction` helper, which falls back to SAVEPOINTs when nesting, plus repository-level helpers) so a crash mid-operation cannot leave half a plan behind.
 - The app is single-user by design: one main window, one writer. There is no cross-process contention to resolve.
 - Regeneration is written as delete-non-locked + insert, preserving locked rows — atomic inside a transaction.
 

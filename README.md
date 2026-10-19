@@ -9,11 +9,12 @@ Every working day, a college coordinator faces the same chain of problems: a fac
 SubstiFlow manages that workflow end to end:
 
 - **Master timetable** — weekly grid of activities per class section: subject, faculty (or faculty team), room, period, and activity type (lecture, lab, tutorial, and other non-teaching types).
+- **Timetable generation** — the master timetable can be generated from two inputs the coordinator maintains: *Teaching Allocations* (who teaches what, including lab teams) and *Subject Requirements* (how many sessions per week a subject needs and how long each session runs). A deterministic solver produces a draft timetable, which is reviewed, validated, and explicitly published — the master timetable is never touched until publish succeeds.
 - **Attendance** — mark faculty present or absent for a given date; affected activities are identified automatically.
 - **Substitution generation** — an engine proposes a substitute for every affected activity, excluding unavailable faculty through hard constraints, ranking the rest by a priority hierarchy (P1–P5) and a transparent weighted score.
 - **Review, approve, lock** — a coordinator reviews the plan, overrides assignments when needed, approves it, and locks individual assignments so regeneration cannot disturb them.
 - **Revised timetable** — the day's timetable is reissued showing Original Faculty → Substitute Faculty for every replaced activity, leaving the master timetable untouched.
-- **Audit trail** — attendance marks, generated plans, overrides, locks, approvals, and timetable edits are recorded with real timestamps.
+- **Audit trail** — attendance marks, generated plans, overrides, locks, approvals, timetable edits, and generated draft publishes are recorded with real timestamps.
 
 The application runs entirely on the local machine: data lives in a SQLite file next to the app, there is no server component, and no network access is required to use it. That is a deliberate architectural choice, not a limitation — coordinators work on college desktops where availability and data ownership matter more than sync.
 
@@ -25,6 +26,11 @@ All of the following are implemented in the current codebase and covered by test
 - **Multi-faculty activities** — an activity can have an ordered team of faculty (e.g. lab sessions shared by several staff), with join-table persistence.
 - **Multi-period activities** — an activity spans one or more consecutive periods (2-hour labs are a single activity, not two entries).
 - **Activity types** — `LECTURE`, `LAB`, `TUTORIAL`, `LIBRARY`, `MENTORING`, `SKILL_BUILD`, `COE`, `OTHER`; lecture and lab require at least one faculty member, other types may legitimately have none.
+- **Teaching Allocations** — who teaches what (per section, subject, and type), with lab teams (several faculty teaching a lab together) and alternates; duplicate-safe CRUD.
+- **Subject Requirements** — how many sessions per week a subject needs for a section and how long each session runs in periods; the authoritative weekly count for generation, separate from who teaches it.
+- **Timetable generation (draft → validate → publish)** — a deterministic backtracking solver (MRV ordering, forward checking, bounded by configurable attempt/timeout limits) builds a draft timetable from requirements + allocations; every hard constraint (section/faculty/room overlap, contiguous spans, break period, working periods, exact weekly counts) is enforced, and soft preferences only order candidates, never trade constraints off.
+- **Generation diagnostics** — a failed run reports status `FAILED` with the section/subject/requirement in scope, the reason, a suggested action, and search statistics (attempts, placements, elapsed); a partial timetable is never presented as success.
+- **Transactional publish** — publishing re-validates the draft inside a database transaction, replaces only the sections the draft covers, remaps or counts as superseded any substitution assignments that pointed at replaced entries, writes an audit entry, and rolls back completely on any conflict.
 - **Faculty/subject qualifications** — subjects qualified per faculty, sections taught per faculty; both feed the substitution ranking.
 - **Attendance** — per-date present/absent marking; absent faculty drive the substitution problem.
 - **Automatic substitution generation** — deterministic engine proposing a substitute per affected activity, with an explicit `uncovered` state when nobody qualifies.
@@ -69,11 +75,24 @@ Spreadsheet-based substitution tracking fails in predictable ways: constraints a
 6. **Rank valid candidates** — sort by tier first, then by weighted score descending (same class, same semester, same department, subject qualification, free slot, low daily load, prior teaching of the section, minus penalties for near-limit load and consecutive slots). Ties resolve deterministically.
 7. **Explain the selection** — each assignment stores a score and a human-readable reasoning string, and the UI renders the full `✓` reason checklist per card. Activities with no valid candidate are persisted as **uncovered** with the attempted candidates and reasons.
 8. **Review** — the Substitution Planner shows every assignment with Original Faculty, Substitute, score, reasons, and policy context; manual overrides are validated against the same constraints.
-9. **Approve** — the run is approved with timestamp and user; approval status is visible in the UI.
+9. **Approve** — the run is approved with timestamp and user; approval status is visible in the UI. Approving a plan that still has uncovered classes is allowed (the coordinator may have arranged those covers outside the app) but never silent: the button names the uncovered count and requires an explicit confirmation.
 10. **Lock** — individual assignments can be locked; locked assignments are preserved across regeneration and reject substitute changes (UI control disabled, service layer refuses the update with an explicit message).
 11. **Generate revised timetable** — the Revised Timetable page shows the reissued day: normal classes and substitutions, each replacement as Original Faculty → Substitute Faculty, with lock state.
 
 Details and diagrams: [docs/SUBSTITUTION_ENGINE.md](docs/SUBSTITUTION_ENGINE.md).
+
+## How Timetable Generation Works
+
+1. **Inputs** — the coordinator maintains two independent tables: *Teaching Allocations* (who teaches which subject for which section, as a lab team or as alternates) and *Subject Requirements* (how many sessions per week that subject needs for that section, and how many consecutive periods each session runs).
+2. **Plan the work** — each requirement becomes a set of session tasks (weekly count × duration in periods). Lab requirements taught by several allocated faculty become *team* tasks (all teach together); everything else is assigned to one of its allocated alternates.
+3. **Search** — a bounded backtracking solver places tasks into the grid, choosing the hardest task first (most constrained first) with forward checking; candidate slots are *ordered* by documented soft preferences (spread across days, earlier days/periods, room fit), which never override a hard constraint.
+4. **Hard constraints** — a placement must respect section overlap, faculty overlap (the whole lab team must be free), room overlap (a real lab room for labs when any exist), contiguous spans, the daily break, configured working days/periods, and the exact weekly counts. If a placement cannot be completed, the solver backtracks.
+5. **Bounded effort** — the search stops at the configured attempt limit or timeout (Settings) and reports the failure; it never hangs and never silently gives up mid-way.
+6. **Outcome** — success creates an immutable *draft* (atomic insert) shown in the Generation page grid; failure produces status `FAILED` with administrator-readable diagnostics: the section/subject/requirement in scope, the reason, a suggested action, and search statistics. A partial timetable is reported as a failure, never as success.
+7. **Validation** — the draft can be validated independently of generation (exact counts, overlaps, spans, break, working periods, allocations still valid).
+8. **Publish** — publishing re-validates and then, in one transaction, replaces only the sections the draft covers in the master timetable, remaps or supersedes substitution assignments that pointed at replaced entries, writes an audit entry, and rolls back completely on any conflict. Until this succeeds, the master timetable is untouched; a failed generation can never damage it.
+
+Deterministic by design: the same inputs and settings always produce the same draft.
 
 ## Screenshots
 
@@ -134,11 +153,11 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 |---|---|
 | Desktop shell | Electron 31 |
 | UI | React 18, TypeScript 5.6, Tailwind CSS 3 |
-| Routing / state | React Router 6, Zustand |
+| Routing / state | React Router 7, Zustand |
 | Forms / validation | react-hook-form, Zod |
 | Database | SQLite via better-sqlite3 (WAL, foreign keys) |
-| Exports | native CSV writer, `xlsx` (Excel) |
-| Build | Vite 5, `tsc` (Electron main), electron-builder 24 |
+| Exports | native CSV writer, `xlsx` 0.20.3 (official SheetJS build) |
+| Build | Vite 6, `tsc` (Electron main), electron-builder 24 |
 | Tests | Vitest 2 |
 
 No cloud services, no telemetry, no network calls at runtime.
@@ -152,15 +171,16 @@ src/
   components/        layout + reusable UI primitives
   services/
     timetable/       validation, conflict detection, entry CRUD, quick entry
+    timetableGenerator.ts  draft generation, validation, publish (Phase 1)
     substitution/    engine, scoring, run lifecycle, lock/approval rules
   db/
     repositories/    one repository per aggregate (parameterised SQL)
-    migrations.ts    forward-only migrations (schema v3)
+    migrations.ts    forward-only migrations (schema v8)
     schema.sql       base schema
   stores/            Zustand app store
   types/             shared domain types
-  __tests__/         regression, product-model, migration, live-workflow, …
-scripts/             postinstall, ABI stamping, migration/seed CLI, assets
+  __tests__/         regression, product-model, generator, migration, live-workflow, …
+scripts/             postinstall, ABI stamping, migration/seed CLI, assets, e2e journeys
 docs/                architecture, data model, engine, testing, security, release
 ```
 
@@ -182,10 +202,19 @@ Other scripts (all defined in `package.json`):
 | `npm test` | Run the Vitest suite (stamps the native module for Node first) |
 | `npm run test:watch` | Vitest in watch mode |
 | `npm run typecheck` | `tsc --noEmit` for the renderer/app code |
+| `npm run e2e` | Playwright journeys against the real packaged app, on an isolated temp database (`scripts/e2e/journeys.js`) |
+| `node scripts/e2e/console-check.js` | Dev-mode React console check (duplicate-key warnings) against an isolated temp database |
 | `npm run build` | Production renderer bundle (Vite) + Electron main (`tsc`) |
 | `npm run dist` | Full build + Windows x64 NSIS installer into `dist-electron/` |
 | `npm run db:migrate` | Run pending database migrations from the CLI |
-| `npm run db:seed` | Load the optional sample BCA dataset |
+| `npm run db:seed` | Load the optional sample BCA dataset (refuses a database that already contains data unless you pass `--force`) |
+| `npm run demo:setup` | Create/reset the **isolated demo database** under `<repo>/.substiflow-demo/` and seed the disposable BCA fixture |
+| `npm run demo:launch` | Launch the real app against the demo database (unmistakable DEMO DATA banner; never falls back to the production profile) |
+| `npm run demo:reset` | Wipe and re-seed the demo database (repeatable, no duplicates) |
+| `npm run demo:status` | Print the resolved demo database path + seeded record counts |
+| `npm run demo:audit` | Read-only audit of the demo timetable (subject-level requirements, sessions, occupied periods, capacity and violations); use `node scripts/demo/audit.js --json --out <file>` for JSON |
+| `npm run demo:remove` | Delete **only** the `.substiflow-demo/` directory (marker-checked; refuses while the demo app is open) |
+| `npm run demo:verify` | Automated walkthrough of the whole demo workflow in the real app (generate → publish → absence → substitution scenarios) |
 | `npm run preview` | Preview the production renderer bundle |
 
 **Development vs production:** in development the renderer is served by Vite on `localhost:5173` and Electron loads that URL; in a packaged build Electron loads the built files from `dist/`. Both use the same SQLite database, so migrations and behaviour are identical.
@@ -194,37 +223,48 @@ Other scripts (all defined in `package.json`):
 
 **Database location:** the SQLite file lives in the OS application-data directory for the app (`…/database/substiflow.db`). Set `SUBSTIFLOW_DATA_DIR` to relocate it (the database folder is created under that directory). The app creates it on first launch and runs pending migrations automatically.
 
+**Demo environment:** `npm run demo:setup` + `npm run demo:launch` open the real app on a disposable, seeded BCA database under `<repo>/.substiflow-demo/` with a DEMO DATA banner — the production profile is never touched, and `npm run demo:remove` deletes the whole thing. Full walkthrough (generation, publish, absence → substitution, uncovered-class reporting, derived-vs-invented data): [docs/DEMO-GUIDE.md](docs/DEMO-GUIDE.md).
+
 ## Testing
 
-Current state: **141 tests across 9 files, all passing** (`npm test`).
+Current state: **250 tests across 18 files, all passing** (`npm test`).
 
 | File | Tests | Covers |
 |---|---:|---|
-| `src/__tests__/regression.test.ts` | 49 | Regression blocks from QA findings, DB integrity, service error paths, lock rules |
+| `src/__tests__/regression.test.ts` | 55 | Regression blocks from QA findings, DB integrity, service error paths, lock rules, unified substitution semantics (daily limit, stale-lock pruning, coverage math), manual-entry parity with the draft validator |
 | `src/__tests__/product-model.test.ts` | 31 | Domain behaviour of the data model (spans, joins, relationships) |
+| `src/__tests__/generator.test.ts` | 27 | Timetable generation end to end: exact weekly counts, hard constraints, determinism, backtracking, impossible-timetable diagnostics, bounded search, publish + rollback, substitution remap, re-publish guard (second publish refused, data untouched), stale-RUNNING crash recovery, summary-query regressions, plus the staff-type/arrangement rules (non-teaching refusal, TEAM needs two teachers, explicit TEAM vs ALTERNATE placement, draft validation, `effectiveTeachingArrangement`) |
 | `src/services/substitution/__tests__/engine.test.ts` | 15 | Engine scenarios: selection, coverage, determinism |
-| `src/services/substitution/__tests__/hard-constraints.test.ts` | 11 | The five hard constraints |
+| `src/services/substitution/__tests__/hard-constraints.test.ts` | 14 | The five hard constraints, plus non-teaching staff excluded from candidates, picker and manual override |
 | `src/__tests__/quick-entry.test.ts` | 10 | Grid quick-entry input resolution |
 | `src/services/substitution/__tests__/priority.test.ts` | 7 | P1–P5 tier assignment |
-| `src/__tests__/migration.test.ts` | 6 | Migrations against fixtures, schema version assertions |
+| `src/__tests__/migration.test.ts` | 9 | Migrations against fixtures, schema version assertions, v7 columns + NULL audit-id backfill, crash-safe replay of migration 2, v8 trigger parity (upgraded vs fresh install) |
 | `src/__tests__/live-workflow.test.ts` | 6 | Full coordinator workflow against a **copy** of the local app database (auto-skips if none exists) |
-| `src/__tests__/backupValidation.test.ts` | 6 | Backup file validation |
+| `src/__tests__/backupValidation.test.ts` | 8 | Backup file validation |
+| `src/__tests__/serviceGuards.test.ts` | 6 | Service guards: allocations refuse non-teaching staff, teaching arrangement validated and persisted |
+| `src/__tests__/allocationEditing.test.ts` | 2 | Teaching-allocation edit path: grouped view carries camelCase fields, dialog payload updates persist |
+| `src/__tests__/iconButton.test.ts` | 4 | The shared `Button size="icon"` markup contract (size classes, `aria-label`s, focus ring) |
+| `src/__tests__/weeklyCounter.test.ts` | 8 | Weekly allocation-counter arithmetic (allocated vs capacity, over-capacity flag, shared requirements counted once) |
+| `src/__tests__/dateParsing.test.ts` | 6 | Timezone-correct parsing: zone-less SQLite stamps are UTC, `yyyy-MM-dd` parses as local midnight |
+| `src/__tests__/demoFixture.test.ts` | 24 | Isolated demo path guards, exact fixture counts/determinism, 124-session/140-occupied-period generation, balanced and intentionally conflicting fixtures, span-aware validation, publish, and both substitution scenarios |
+| `src/__tests__/draftGridRender.test.ts` | 9 | Draft timetable grid rendering for spans, rooms, faculty teams, breaks, and time labels |
+| `src/__tests__/timetableQuality.test.ts` | 9 | Demo timetable quality, capacity/distribution, determinism, and publish checks |
 
 Notes:
 
 - The live-workflow suite snapshots the local database, runs against the snapshot, and deletes it; the real database is never written to. On a fresh machine without a database it skips automatically.
-- There is no CI pipeline in this repository yet — the suite is run locally. Coverage has not been measured; no coverage figure is claimed.
-- End-to-end UI acceptance runs were performed with an external Playwright harness outside this repository; its records are kept locally and are not part of `npm test`.
+- A CI pipeline for the development platform (`.github/workflows/ci.yml`, macOS) runs `npm ci`, `npm test`, both TypeScript checks and `npm run build`. A separate Windows compatibility pipeline (`.github/workflows/windows-compatibility.yml`) repeats install → tests → typechecks → build → NSIS installer on a `windows-latest` runner, uploads the installer artifact, and adds an **experimental** GUI smoke job (non-blocking until observed green — read its log rather than trusting the status). Both workflows are prepared locally and have not run on a hosted runner yet. The GUI E2E suite is otherwise run locally. Coverage has not been measured; no coverage figure is claimed.
+- `npm run e2e` drives the **real packaged app** with Playwright through nine journeys (setup wizard → generate → validate → publish → master timetable; manual-testing fixes — honest department-select state, non-teaching staff excluded from allocations/substitutions, TEAM arrangement end to end, teaching-allocation edit + delete through the real dialogs, plain-text faculty cells with every action icon on a single row; weekly allocation counter verified at 0/2/3/5/7 sessions, across edit/delete/reload, and over capacity; impossible requirement → diagnostics; attendance → substitution approval including the approve-with-uncovered confirmation; TEAM lab + ALTERNATE arrangement end to end with publish; relaunch → auto backup; every page renders (and the sidebar reports the main-process version); legacy NULL-id audit rows render; migration backfill after relaunch) against an isolated temporary database, and fails if the app makes any non-localhost network request — **118/118 checks** at last run. The runner is self-contained in `scripts/e2e/journeys.js` and is Windows-portable (platform-aware process cleanup); `playwright` is a declared development dependency (a clean `npm ci` is enough to run it), while `npm test` never touches it. React's dev-only console warnings (e.g. the duplicate-key report) are checked separately by `node scripts/e2e/console-check.js`, which boots the dev environment against its own isolated database. Details: [docs/TESTING.md](docs/TESTING.md).
 
 Full testing documentation: [docs/TESTING.md](docs/TESTING.md).
 
 ## Database & Migrations
 
 - Single local SQLite file, `journal_mode = WAL`, `foreign_keys = ON`.
-- **Forward-only migrations** in `src/db/migrations.ts`, each wrapped in a transaction, tracked in a `schema_version` table. Current schema version: **3**.
+- **Forward-only migrations** in `src/db/migrations.ts`, each wrapped in a transaction, tracked in a `schema_version` table. Current schema version: **8**.
 - Migrations run automatically when the app opens the database, or on demand via `npm run db:migrate`.
 - There are no down-migrations; the recovery path is restore-from-backup (see below).
-- Before upgrading against real data, take a backup (Settings → Backup & Restore, or rely on the automatic per-launch-day snapshot in `auto-backups/`).
+- Before upgrading against real data, take a backup (Settings → Backup & Restore, or rely on the automatic per-launch-day snapshot in `auto-backups/`). Every launch that finds an **older schema** additionally writes a `pre-upgrade-<timestamp>.db` snapshot (kept: 5) *before* migrations run, and startup verifies the file with `PRAGMA quick_check` — corruption is reported once, at startup, with restore instructions.
 
 Schema concepts: [docs/DATA_MODEL.md](docs/DATA_MODEL.md).
 
@@ -235,15 +275,18 @@ Verified properties (see [docs/SECURITY.md](docs/SECURITY.md) for the full write
 - Renderer runs with `nodeIntegration: false`, `contextIsolation: true`, default sandbox; no direct Node or filesystem access from UI code.
 - A minimal preload bridge (`contextBridge`) exposes only database, backup, app-info, and print operations.
 - Every IPC handler verifies the sender is the main window's own `webContents` before touching the database.
-- Navigation and window-open are restricted (allowlisted in-app navigation; external `http(s)`/`mailto` links open in the OS browser, other schemes are blocked).
-- SQL goes through parameterised repository queries; backup import validates the file is a real SQLite database and requires explicit confirmation.
+- **One process per database**: a single-instance lock (scoped to the data directory) refuses a second launch and focuses the running window; the maintenance CLI refuses to touch a database the app has open.
+- **Strict production CSP**: the built renderer runs with `script-src 'self'` and `connect-src 'none'` (no inline scripts, no network of any kind); development keeps the policy Vite's HMR needs.
+- Navigation and window-open are restricted (only the app's own `dist/renderer` bundle in production; external `http(s)`/`mailto` links open in the OS browser, other schemes are blocked).
+- SQL goes through parameterised repository queries; backup import validates the file is a real SQLite database (including a schema/structure check), refuses the live database path, swaps and rolls back **atomically** (stage + rename) after a safety snapshot — all behind an explicit confirmation.
 - No secrets, credentials, or environment files are committed to this repository; all data is stored locally.
+- `npm audit` reports **no advisories in the runtime dependency set**; the 31 remaining advisories are development/build tooling with documented upgrade paths — see [Dependency advisory posture](docs/SECURITY.md#dependency-advisory-posture-npm-audit).
 
 Known accepted limitations are listed honestly in [docs/SECURITY.md](docs/SECURITY.md) and [Limitations](#limitations).
 
 ## Backup & Recovery
 
-- **Manual export/import** — Settings/Backup page: export writes a validated snapshot (`substiflow-backup-<date>.db`) through a native save dialog; import verifies integrity first and asks for confirmation before overwriting.
+- **Manual export/import** — Settings/Backup page: export writes a validated snapshot (`substiflow-backup-<date>.db`) through a native save dialog; import verifies the file is a genuine database with a compatible schema, snapshots the current data first, overwrites only after validation, and restores the snapshot if the import fails half-way — always behind an explicit confirmation.
 - **Automatic snapshots** — on each launch day the app snapshots the database into `auto-backups/` beside the database and prunes old snapshots to the configured retention. Backup failures are logged and never block startup.
 - **Recovery** — replace the database file with a backup (import dialog or file copy) and start the app; migrations bring an older backup forward on open.
 
@@ -258,8 +301,8 @@ Known accepted limitations are listed honestly in [docs/SECURITY.md](docs/SECURI
 
 Being straight about what this is:
 
-- **Windows runtime not verified.** The Windows NSIS installer is produced by `npm run dist` (including from a macOS host), but this project has not been executed or smoke-tested on an actual Windows machine. Builds and tests run on the development host.
-- **No CI.** Tests and builds run locally; there is no hosted pipeline or build badge.
+- **Windows runtime not verified.** The Windows NSIS installer is produced by `npm run dist` (including from a macOS host; the packaged contents — main/preload/renderer/migrations/schema/Windows native module — were inspected inside the asar), and a Windows CI workflow plus a Windows-portable E2E smoke path are prepared, but the packaged application has **not yet run on an actual Windows machine or hosted Windows runner**. Details and the exact evidence levels: [docs/WINDOWS.md](docs/WINDOWS.md).
+- **CI workflows exist but have not run hosted.** `ci.yml` (macOS) and `windows-compatibility.yml` (Windows, with an experimental non-blocking GUI smoke job) are defined in the working tree; the changes are uncommitted, so no hosted pipeline or badge exists yet.
 - **Native print dialog is not automatable** in the current test harness, so the print path is verified by code review and the shared HTML/PDF code path rather than automated clicks.
 - **Single-user, no authentication.** The app assumes one trusted coordinator on one machine. There are no user accounts, roles, or encryption at rest.
 - **One timetable source of truth, entered by hand or seed.** There is no import from institutional timetabling systems (see Roadmap).
@@ -273,7 +316,7 @@ Future work, none of it implemented today:
 - Timetable import (CSV/structured import into the master grid)
 - Richer term management (term templates, rollover between academic years)
 - Additional packaging targets (macOS, Linux) alongside the current Windows installer
-- A hosted CI workflow running the test suite on push
+- Running the prepared CI workflows on a hosted runner (macOS + Windows) and completing a manual Windows desktop installer test
 - Optional database encryption / multi-user audit attribution
 
 ## Documentation
@@ -287,6 +330,7 @@ Future work, none of it implemented today:
 | [docs/TESTING.md](docs/TESTING.md) | Test strategy, suites, commands |
 | [docs/SECURITY.md](docs/SECURITY.md) | Security boundaries and accepted risks |
 | [docs/RELEASE.md](docs/RELEASE.md) | Build, packaging, release checklist |
+| [docs/WINDOWS.md](docs/WINDOWS.md) | Windows compatibility audit, evidence levels, CI workflow |
 | [docs/SubstiFlow_PRD_v1.0.docx](docs/SubstiFlow_PRD_v1.0.docx) | Product requirements (v1.0) |
 | [CHANGELOG.md](CHANGELOG.md) | Project history |
 

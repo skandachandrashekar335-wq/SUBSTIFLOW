@@ -185,7 +185,7 @@ export function Classes() {
         <DialogContent className="space-y-4">
           <Input label="Section Name" value={formData.name} onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))} placeholder="e.g., III BCA-B" required />
           <Input label="Semester" type="number" value={formData.semester} onChange={(e) => setFormData(prev => ({ ...prev, semester: e.target.value }))} min={1} max={8} required />
-          <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} required />
+          <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} placeholder="Select department" required />
         </DialogContent>
         <DialogFooter>
           <Button variant="secondary" onClick={() => { setShowForm(false); setEditingSection(null); }}>Cancel</Button>

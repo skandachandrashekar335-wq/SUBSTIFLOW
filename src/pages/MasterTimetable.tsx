@@ -23,6 +23,7 @@ import {
   facultyForSubject,
   reconcileTeamChange,
   TimetableConflictError,
+  replaceTimetableEntries,
   NO_SUBJECTS_FOR_FACULTY,
   NO_FACULTY_FOR_SUBJECT,
 } from '@/services/timetable'
@@ -197,20 +198,18 @@ export function MasterTimetable() {
   }
 
   /** Coordinator picked "Replace Existing": drop the clashing entries (and
-   *  their substitution history), then retry the exact same save. */
+   *  their substitution history) and retry the exact same save — ATOMICALLY.
+   *  If the retry fails, the deletions roll back (replaceTimetableEntries),
+   *  so a failed replace never destroys entries without storing a
+   *  replacement. */
   const handleConflictReplace = () => {
     if (!conflict) return
     const { conflicts, retry } = conflict
     try {
-      for (const c of conflicts) {
-        try {
-          deleteTimetableEntry(c.entryId)
-        } catch {
-          // Already removed (e.g. duplicate conflicts on one entry) — retry
-          // will tell us if anything is actually wrong.
-        }
-      }
-      retry()
+      replaceTimetableEntries(
+        conflicts.map(c => c.entryId),
+        retry
+      )
       setConflict(null)
       reloadEntries()
     } catch (error) {
@@ -557,7 +556,7 @@ export function MasterTimetable() {
       <Card>
         <CardBody className="flex flex-wrap items-center gap-4">
           <Input placeholder="Search..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-64" />
-          <Select value={selectedSection} onChange={setSelectedSection} options={sectionFilterOptions} className="w-48" placeholder="Section" />
+          <Select data-testid="filter-section" value={selectedSection} onChange={setSelectedSection} options={sectionFilterOptions} className="w-48" placeholder="Section" />
           <Select value={selectedFaculty} onChange={setSelectedFaculty} options={facultyFilterOptions} className="w-48" placeholder="Faculty" />
           <Select value={selectedSubject} onChange={setSelectedSubject} options={subjectFilterOptions} className="w-48" placeholder="Subject" />
           {selectedSection && (
@@ -585,6 +584,22 @@ export function MasterTimetable() {
         </div>
       )}
 
+      {sections.length === 0 && (
+        <div className="flex items-start gap-3 p-4 bg-info-50 border border-info-200 rounded-lg" data-testid="no-sections-notice">
+          <AlertTriangle className="h-5 w-5 text-info-600 mt-0.5 shrink-0" />
+          <div className="text-sm text-info-800 space-y-1">
+            <p className="font-medium">No classes (sections) configured yet</p>
+            <p>
+              The grid below has nothing to show until at least one class exists.
+              Create your classes first, then add timetable entries here.
+            </p>
+            <Link to="/classes" className="underline font-medium">
+              Go to Classes →
+            </Link>
+          </div>
+        </div>
+      )}
+
       <Card>
         <CardBody className="p-0 overflow-auto">
           {/* ONE grid renders header and body, so both share identical track
@@ -598,6 +613,7 @@ export function MasterTimetable() {
               table rather than a field of floating cards. */}
           <div
             className="grid"
+            data-testid="master-grid"
             style={{ gridTemplateColumns: `96px repeat(${allSlots.length}, minmax(140px, 1fr))` }}
           >
             <div className="min-w-0 p-2 border border-secondary-200 bg-secondary-50 font-semibold text-center text-secondary-700 text-xs">Day / Time</div>

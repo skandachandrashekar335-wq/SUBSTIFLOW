@@ -83,7 +83,7 @@ export function BackupRestore() {
   const handleImportBackup = async () => {
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = '.db,.sqlite,.sql'
+    input.accept = '.db,.sqlite,.sqlite3'
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0]
       if (!file) return
@@ -94,7 +94,14 @@ export function BackupRestore() {
         if (typeof window.electron !== 'undefined' && window.electron.backup) {
           const result = await window.electron.backup.importBackup(file.path)
           if (result.success) {
-            setMessage({ type: 'success', text: 'Backup imported successfully. Please restart the application.' })
+            setMessage({
+              type: 'success',
+              text: 'Backup imported successfully. Reloading so every page shows the imported data…',
+            })
+            // The main process swapped the database in place and reopened it
+            // (running any pending migrations); reloading the renderer drops
+            // every cached view so no page keeps showing pre-import state.
+            setTimeout(() => window.location.reload(), 1500)
           } else {
             setMessage({ type: 'error', text: result.error || 'Import failed' })
           }

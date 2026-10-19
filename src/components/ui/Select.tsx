@@ -20,6 +20,14 @@ export interface SelectProps extends Omit<SelectHTMLAttributes<HTMLSelectElement
 export const Select = forwardRef<HTMLSelectElement, SelectProps>(
   ({ className, label, error, helperText, options, placeholder, id, value, onChange, ...props }, ref) => {
     const selectId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // Root cause of "the dropdown shows a value but submit says it is
+    // required": a controlled <select> whose value matches no option renders
+    // the first option while the state stays empty — the form looks filled in
+    // but never was. Whenever nothing is selected and the option list has no
+    // empty entry, render an explicit empty option so the displayed state and
+    // the stored state can never diverge.
+    const needsEmptyOption =
+      !placeholder && value === '' && !options.some((option) => option.value === '')
 
     return (
       <div className="w-full">
@@ -45,9 +53,9 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
           aria-describedby={error ? `${selectId}-error` : helperText ? `${selectId}-helper` : undefined}
           {...props}
         >
-          {placeholder && (
+          {(placeholder || needsEmptyOption) && (
             <option value="" disabled>
-              {placeholder}
+              {placeholder ?? 'Select…'}
             </option>
           )}
           {options.map((option) => (

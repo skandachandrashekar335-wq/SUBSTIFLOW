@@ -8,7 +8,9 @@ import { Select, SelectOption } from '@/components/ui/Select'
 import { Dialog, DialogHeader, DialogContent, DialogFooter } from '@/components/ui/Dialog'
 import { useAppStore } from '@/stores/appStore'
 import { facultyRepository, departmentRepository, subjectRepository, sectionRepository } from '@/db/repositories'
-import type { Faculty as FacultyType } from '@/types'
+import { withTransaction } from '@/db/transaction'
+import type { Faculty as FacultyType, StaffType } from '@/types'
+import { STAFF_TYPES, STAFF_TYPE_LABELS } from '@/types'
 import { cn } from '@/utils/cn'
 
 export function Faculty() {
@@ -23,6 +25,7 @@ export function Faculty() {
     employeeId: '',
     departmentId: '',
     isActive: true,
+    staffType: 'TEACHING' as StaffType,
     // Raw strings while editing: a controlled number input plus parseInt(x) || 0
     // silently turned "clear the field" into a meaningful 0 on every keystroke.
     maxDailySubstitutions: '2',
@@ -74,6 +77,7 @@ export function Faculty() {
       employeeId: formData.employeeId.trim() || undefined,
       departmentId: formData.departmentId,
       isActive: formData.isActive,
+      staffType: formData.staffType,
       maxDailySubstitutions,
       priority,
       notes: formData.notes,
@@ -87,20 +91,26 @@ export function Faculty() {
         const priorProficiency = new Map<string, number>(
           (existing?.subjects ?? []).map((s: any) => [s.id, s.proficiency ?? 3])
         )
-        facultyRepository.update(editingFaculty.id, data)
-        facultyRepository.setSubjects(
-          editingFaculty.id,
-          formData.subjectIds.map(id => ({
-            facultyId: editingFaculty.id,
-            subjectId: id,
-            proficiency: priorProficiency.get(id) ?? 3,
-          }))
-        )
-        facultyRepository.setSections(editingFaculty.id, formData.sectionIds)
+        // A failure between the three writes must never leave a faculty row
+        // whose subject/section mappings describe a half-applied edit.
+        withTransaction(() => {
+          facultyRepository.update(editingFaculty.id, data)
+          facultyRepository.setSubjects(
+            editingFaculty.id,
+            formData.subjectIds.map(id => ({
+              facultyId: editingFaculty.id,
+              subjectId: id,
+              proficiency: priorProficiency.get(id) ?? 3,
+            }))
+          )
+          facultyRepository.setSections(editingFaculty.id, formData.sectionIds)
+        })
       } else {
         const newFaculty = facultyRepository.create({ id: crypto.randomUUID(), ...data })
-        facultyRepository.setSubjects(newFaculty.id, formData.subjectIds.map(id => ({ facultyId: newFaculty.id, subjectId: id, proficiency: 3 })))
-        facultyRepository.setSections(newFaculty.id, formData.sectionIds)
+        withTransaction(() => {
+          facultyRepository.setSubjects(newFaculty.id, formData.subjectIds.map(id => ({ facultyId: newFaculty.id, subjectId: id, proficiency: 3 })))
+          facultyRepository.setSections(newFaculty.id, formData.sectionIds)
+        })
       }
 
       setShowForm(false)
@@ -129,6 +139,7 @@ export function Faculty() {
       employeeId: f.employeeId || '',
       departmentId: f.departmentId,
       isActive: f.isActive,
+      staffType: f.staffType || 'TEACHING',
       maxDailySubstitutions: String(f.maxDailySubstitutions),
       priority: String(f.priority),
       notes: f.notes || '',
@@ -161,6 +172,7 @@ export function Faculty() {
       employeeId: '',
       departmentId: '',
       isActive: true,
+      staffType: 'TEACHING',
       maxDailySubstitutions: '2',
       priority: '0',
       notes: '',
@@ -171,6 +183,7 @@ export function Faculty() {
 
   const departmentOptions: SelectOption[] = [{ value: '', label: 'All Departments' }, ...departments.map(d => ({ value: d.id, label: d.name }))]
   const departmentFormOptions: SelectOption[] = departments.map(d => ({ value: d.id, label: d.name }))
+  const staffTypeOptions: SelectOption[] = STAFF_TYPES.map(s => ({ value: s, label: STAFF_TYPE_LABELS[s] }))
   const subjectOptions: SelectOption[] = allSubjects.map(s => ({ value: s.id, label: s.name }))
   const sectionOptions: SelectOption[] = allSections.map(s => ({ value: s.id, label: s.name }))
 
@@ -225,6 +238,9 @@ export function Faculty() {
                             <Badge variant={f.isActive ? 'success' : 'neutral'}>
                               {f.isActive ? 'Active' : 'Inactive'}
                             </Badge>
+                            {f.staffType === 'NON_TEACHING' && (
+                              <Badge variant="warning">Non-teaching</Badge>
+                            )}
                           </div>
                           <div className="flex flex-wrap items-center gap-3 text-sm text-secondary-500 mt-1">
                             {f.employeeId && <span>ID: {f.employeeId}</span>}
@@ -274,7 +290,19 @@ export function Faculty() {
           <div className="grid gap-4 md:grid-cols-2">
             <Input label="Name" value={formData.name} onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))} required />
             <Input label="Employee ID" value={formData.employeeId} onChange={(e) => setFormData(prev => ({ ...prev, employeeId: e.target.value }))} />
-            <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} required />
+            <Select label="Department" value={formData.departmentId} onChange={(v) => setFormData(prev => ({ ...prev, departmentId: v }))} options={departmentFormOptions} placeholder="Select department" required />
+            <Select
+              label="Staff Type"
+              value={formData.staffType}
+              onChange={(v) => setFormData(prev => ({ ...prev, staffType: v as StaffType }))}
+              options={staffTypeOptions}
+              helperText={
+                formData.staffType === 'NON_TEACHING'
+                  ? 'Non-teaching staff are never scheduled and never offered as substitutes.'
+                  : 'Teaching staff can be scheduled and asked to substitute.'
+              }
+              required
+            />
             <Input
               label="Max Daily Substitutions"
               type="number"

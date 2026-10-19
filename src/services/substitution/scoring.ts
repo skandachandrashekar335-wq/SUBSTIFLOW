@@ -292,6 +292,8 @@ export function getEligibleCandidates(
 
   for (const faculty of allFaculty) {
     if (!faculty.isActive) continue
+    // Non-teaching staff never cover classes, no matter how free they are.
+    if (faculty.staffType === 'NON_TEACHING') continue
     
     const availability = facultyAvailability.get(faculty.id)
     if (!availability) continue

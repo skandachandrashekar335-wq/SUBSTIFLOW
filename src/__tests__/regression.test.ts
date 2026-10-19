@@ -77,6 +77,8 @@ import {
   updateSubstitutionAssignment,
   availableSubstitutesForAssignment,
   validateSubstitute,
+  validateSubstituteAssignment,
+  computeCoverage,
   lockAssignment,
   getRevisedTimetable,
 } from '@/services/substitution'
@@ -705,8 +707,13 @@ describe('QA-024: generation reports true statistics immediately', () => {
     const result = generateSubstitutions(SUB_DATE)
     const persisted = substitutionAssignmentRepository.findByRunWithRelations(result.runId)
     expect(result.assignments).toHaveLength(persisted.length)
-    expect(result.statistics.covered).toBe(persisted.filter(a => a.substituteFacultyId).length)
-    expect(result.statistics.uncovered).toBe(persisted.filter(a => !a.substituteFacultyId).length)
+    expect(result.statistics.covered).toBe(persisted.filter(a => a.substituteFacultyId && a.status !== 'REJECTED').length)
+    // Unified semantics: uncovered is what remains of the AFFECTED set —
+    // never the raw count of substitute-less rows (which could exceed the
+    // affected count and produce negative numbers in reports).
+    expect(result.statistics.uncovered).toBe(
+      Math.max(0, result.statistics.totalAffected - result.statistics.covered)
+    )
     expect(result.statistics.totalAffected).toBeGreaterThanOrEqual(persisted.length)
   })
 })
@@ -834,6 +841,11 @@ describe('QA-021: the uncovered card opens a picker that actually works', () => 
     const uncoveredRow = result.assignments.find(a => !a.substituteFacultyId)
     expect(uncoveredRow).toBeTruthy()
 
+    // Coordinator lifts the cap again before re-opening the picker (with the
+    // cap at 0 the institution-wide limit correctly forbids every candidate —
+    // unified limit semantics apply to the manual picker too).
+    settingsRepository.set('max_daily_substitutions', '3', 'Maximum daily substitutions per faculty')
+
     // The pre-fix UI sent id:'' — it could never produce a single option.
     expect(availableSubstitutesForAssignment('')).toEqual([])
 
@@ -844,6 +856,87 @@ describe('QA-021: the uncovered card opens a picker that actually works', () => 
     expect(
       updateSubstitutionAssignment(uncoveredRow!.id, { substituteFacultyId: options[0].id })
     ).toBeTruthy()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 23b. Unified substitution semantics (single limit rule, honest statistics)
+// ---------------------------------------------------------------------------
+describe('unified substitution semantics', () => {
+  it('a generated PENDING row already reserves the substitute\'s daily slot', () => {
+    seedSubstitutionScenario()
+    const first = generateSubstitutions(SUB_DATE)
+    const coveredRows = first.assignments.filter((a) => a.substituteFacultyId)
+    expect(coveredRows.length).toBeGreaterThan(0)
+    expect(coveredRows.every((a) => a.status === 'PENDING')).toBe(true)
+    // The repository count (used by generation's availability map) must see
+    // PENDING rows — previously it counted only APPROVED/LOCKED while the
+    // manual picker counted everything but REJECTED.
+    const substituteId = coveredRows[0].substituteFacultyId!
+    expect(facultyRepository.getDailySubstitutionCount(substituteId, SUB_DATE)).toBe(
+      coveredRows.filter((a) => a.substituteFacultyId === substituteId).length
+    )
+  })
+
+  it('the manual picker enforces min(personal, institution-wide) like generation', () => {
+    seedSubstitutionScenario()
+    // Institution-wide cap 0 forces every affected class uncovered…
+    settingsRepository.setMaxDailySubstitutions(0)
+    const result = generateSubstitutions(SUB_DATE)
+    const uncovered = result.assignments.find((a) => !a.substituteFacultyId)!
+    expect(uncovered).toBeTruthy()
+
+    // …and correctly forbids every manual candidate too.
+    const blocked = validateSubstituteAssignment(uncovered.id, 'fac-3')
+    expect(blocked.ok).toBe(false)
+    expect(blocked.reason).toMatch(/daily limit/i)
+
+    // Coordinator raises the institution-wide cap → the picker opens again.
+    settingsRepository.setMaxDailySubstitutions(3)
+    expect(validateSubstituteAssignment(uncovered.id, 'fac-3').ok).toBe(true)
+
+    // The PERSONAL limit can still bind tighter than the institution-wide one.
+    facultyRepository.update('fac-3', { maxDailySubstitutions: 0 })
+    const personalBlocked = validateSubstituteAssignment(uncovered.id, 'fac-3')
+    expect(personalBlocked.ok).toBe(false)
+    expect(personalBlocked.reason).toMatch(/daily limit of 0/)
+  })
+
+  it('a locked override survives regeneration only while its class is still affected', () => {
+    seedSubstitutionScenario()
+    const first = generateSubstitutions(SUB_DATE)
+    const covered = first.assignments.find(a => a.substituteFacultyId)!
+    lockAssignment(covered.id)
+    const lockedEntryId = covered.originalEntryId
+    expect(
+      substitutionAssignmentRepository.findByRunWithRelations(first.runId)
+        .find((r) => r.originalEntryId === lockedEntryId)?.status
+    ).toBe('LOCKED')
+
+    // Coordinator re-marks the teacher PRESENT: nothing is affected any more.
+    // The old behaviour kept the lock, reporting a substitute covering a
+    // class that no longer needs one (and driving "uncovered" negative).
+    attendanceRepository.upsert(SUB_DATE, 'fac-1', 'PRESENT')
+    const regen = generateSubstitutions(SUB_DATE)
+    const rows = substitutionAssignmentRepository.findByRunWithRelations(regen.runId)
+    expect(rows.find((r) => r.originalEntryId === lockedEntryId)).toBeUndefined()
+    expect(regen.statistics.totalAffected).toBe(0)
+    expect(regen.statistics.covered).toBe(0)
+    expect(regen.statistics.uncovered).toBe(0)
+  })
+
+  it('computeCoverage ignores REJECTED rows and never goes negative', () => {
+    expect(
+      computeCoverage(3, [
+        { substituteFacultyId: 'f1', status: 'PENDING' },
+        { substituteFacultyId: null, status: 'PENDING' },
+      ])
+    ).toEqual({ covered: 1, uncovered: 2 })
+    expect(computeCoverage(1, [{ substituteFacultyId: 'f1', status: 'REJECTED' }])).toEqual({
+      covered: 0,
+      uncovered: 1,
+    })
+    expect(computeCoverage(0, [])).toEqual({ covered: 0, uncovered: 0 })
   })
 })
 
@@ -1092,5 +1185,73 @@ describe('locked assignment refuses substitute changes at the service layer', ()
     expect(row.is_locked).toBe(0)
     expect(updateSubstitutionAssignment(covered.id, { substituteFacultyId: null })).toBeTruthy()
     expect(assignmentRow(covered.id).substitute_faculty_id).toBeFalsy()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 26b. Manual entry parity with the draft validator (same scheduling rules)
+// ---------------------------------------------------------------------------
+describe('manual entry parity with the draft validator', () => {
+  it('rejects non-teaching and inactive faculty — the generator never could schedule them', () => {
+    facultyRepository.create({ id: 'fac-nt', name: 'Office Incharge', departmentId: 'dept-bca' })
+    facultyRepository.update('fac-nt', { staffType: 'NON_TEACHING' })
+    facultyRepository.setSubjects('fac-nt', [{ facultyId: 'fac-nt', subjectId: 'sub-1', proficiency: 3 }])
+
+    let message = ''
+    try {
+      createTimetableEntry(baseEntry({ facultyIds: ['fac-nt'] }), 'year-1')
+    } catch (e: any) {
+      message = e.message
+    }
+    expect(message).toMatch(/non-teaching/i)
+    expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(0)
+
+    facultyRepository.update('fac-1', { isActive: false })
+    let inactiveMessage = ''
+    try {
+      createTimetableEntry(baseEntry(), 'year-1')
+    } catch (e: any) {
+      inactiveMessage = e.message
+    }
+    expect(inactiveMessage).toMatch(/inactive/i)
+  })
+
+  it('rejects non-working days, out-of-hours periods and periods spanning the break', () => {
+    settingsRepository.setWorkingDays(['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY'])
+
+    let dayMessage = ''
+    try {
+      createTimetableEntry(baseEntry({ dayOfWeek: 'SATURDAY' }), 'year-1')
+    } catch (e: any) {
+      dayMessage = e.message
+    }
+    expect(dayMessage).toMatch(/not a configured working day/i)
+
+    // A period before the configured opening time (defaults: 09:00–16:00).
+    timeSlotRepository.create({
+      id: 'slot-early',
+      name: '07:00-08:00',
+      startTime: '07:00',
+      endTime: '08:00',
+      order: 0,
+      isBreak: false,
+    })
+    let hoursMessage = ''
+    try {
+      createTimetableEntry(baseEntry({ timeSlotId: 'slot-early' }), 'year-1')
+    } catch (e: any) {
+      hoursMessage = e.message
+    }
+    expect(hoursMessage).toMatch(/outside the configured working hours/i)
+
+    // slot-4 (12:00–13:00) + span 2 runs into the 13:00–14:00 break.
+    let breakMessage = ''
+    try {
+      createTimetableEntry(baseEntry({ timeSlotId: 'slot-4', span: 2 }), 'year-1')
+    } catch (e: any) {
+      breakMessage = e.message
+    }
+    expect(breakMessage).toMatch(/break/i)
+    expect(timetableEntryRepository.getWithRelations('year-1')).toHaveLength(0)
   })
 })

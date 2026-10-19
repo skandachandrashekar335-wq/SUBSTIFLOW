@@ -13,3 +13,8 @@ export { substitutionRunRepository, substitutionAssignmentRepository } from './s
 export { settingsRepository } from './settings'
 export { termRepository } from './term'
 export { auditLogRepository, AUDIT_ACTIONS } from './auditLog'
+export { teachingAllocationRepository } from './teachingAllocation'
+export { timetableGenerationRepository } from './timetableGeneration'
+export { draftTimetableEntryRepository } from './draftTimetableEntry'
+export { generationDiagnosticRepository } from './generationDiagnostic'
+export { subjectRequirementRepository } from './subjectRequirement'
