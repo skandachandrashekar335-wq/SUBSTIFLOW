@@ -14,7 +14,7 @@ name: Windows Compatibility
 # green workflow badge does NOT mean the smoke job passed — read its log.
 #
 # No new package scripts are introduced here: every step reuses the existing
-# `package.json` scripts (`npm ci`, `npm test`, `npm run build`, `npm run
+# `package.json` scripts (`npm ci --ignore-scripts`, `npm test`, `npm run build`, `npm run
 # dist`, `npm run e2e`). `npm run dist` already handles the native-module
 # dance on Windows: `predist` stamps better-sqlite3 with the win32-x64
 # Electron prebuild, then electron-builder packages it with `npmRebuild:
@@ -36,7 +36,17 @@ jobs:
           cache: npm
 
       - name: Clean install from lockfile
-        run: npm ci
+        # The repository postinstall hook intentionally prepares Electron's
+        # native ABI. On windows-latest, npm's automatic better-sqlite3
+        # fallback can invoke node-gyp before the runner's Visual Studio major
+        # is recognised. Install dependencies without hooks, then use the
+        # prebuild-first ABI helper explicitly.
+        run: npm ci --ignore-scripts
+
+      - name: Prepare Electron runtime and native module
+        run: |
+          node node_modules/electron/install.js
+          node scripts/ensure-abi.js electron
 
       - name: Unit and integration tests
         run: npm test
@@ -102,7 +112,12 @@ jobs:
           cache: npm
 
       - name: Clean install from lockfile
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      - name: Prepare Electron runtime and native module
+        run: |
+          node node_modules/electron/install.js
+          node scripts/ensure-abi.js electron
 
       - name: E2E journeys against the real app (isolated temp database)
         # `npm run e2e` builds the app itself, points SUBSTIFLOW_DATA_DIR at

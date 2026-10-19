@@ -135,8 +135,8 @@ pipeline, not the runtime.
 `.github/workflows/windows-compatibility.yml` (separate from the macOS
 `ci.yml`):
 
-1. `windows-verify` (blocking): checkout → Node 20 → `npm ci` → `npm test`
-   → `npx tsc --noEmit` → `npx tsc -p tsconfig.electron.json --noEmit` →
+1. `windows-verify` (blocking): checkout → Node 20 → `npm ci --ignore-scripts` →
+   Electron runtime/native prebuild preparation → `npm test` → `npx tsc --noEmit` → `npx tsc -p tsconfig.electron.json --noEmit` →
    `npm run build` → `npm run dist` (NSIS) → assert
    `dist-electron\SubstiFlow-Setup.exe` exists and is ≥ 10 MB → upload the
    installer (+ `latest.yml`) as a workflow artifact for manual testing on
@@ -161,7 +161,7 @@ pipeline, not the runtime.
 | Command | Where | Result |
 |---|---|---|
 | `npm run dist` | macOS host | exit 0 — `SubstiFlow-Setup.exe` (PE32 NSIS, 83,617,673 B), `win-unpacked/SubstiFlow.exe` (PE32+ x86-64), asar contents verified (see §1) |
-| `npm test` | macOS host | 208/208 passing |
+| `npm test` | macOS host | 250/250 passing |
 | `npm run e2e` | macOS host | 118/118 checks PASS incl. journey H (with publish) + offline assertion + sidebar main-process-version check |
 | spaced-path launch (ad-hoc script, isolated temp dir) | macOS host | PASS — DB created, schema v8, wizard rendered |
-| `windows-compatibility.yml` | windows-latest | prepared — **not yet run** |
+| `windows-compatibility.yml` | windows-latest | first hosted run reached clean install but failed in the old postinstall/node-gyp path; workflow now uses `npm ci --ignore-scripts` plus prebuild-first ABI preparation and requires a fresh hosted run |

@@ -110,7 +110,25 @@ if (target === 'win32') {
   ok = run('npm', ['rebuild', 'better-sqlite3']).status === 0
   hint = '  npm rebuild better-sqlite3'
 } else {
-  ok = run('npx', ['electron-rebuild', '-f', '-w', 'better-sqlite3']).status === 0
+  // Prefer the published Electron prebuild. This avoids requiring a native
+  // compiler on clean Windows runners where Visual Studio may be installed
+  // under a newer major that node-gyp does not recognise. Keep
+  // electron-rebuild as the fallback for a platform/ABI without a prebuild.
+  const prebuild = path.join(root, 'node_modules', '.bin', 'prebuild-install')
+  const prebuildResult = run(
+    prebuild,
+    [
+      '--runtime=electron',
+      `--target=${electronVersion()}`,
+      `--arch=${process.arch}`,
+      `--platform=${process.platform}`,
+    ],
+    { cwd: nativeModuleDir },
+  )
+  ok = prebuildResult.status === 0 && binaryMatchesPlatform(stampPlatform(wanted))
+  if (!ok) {
+    ok = run('npx', ['electron-rebuild', '-f', '-w', 'better-sqlite3']).status === 0
+  }
   hint = '  npx electron-rebuild -f -w better-sqlite3'
 }
 
