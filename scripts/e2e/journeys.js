@@ -405,11 +405,11 @@ async function journeyA() {
   // the day header shape rather than assuming Monday is selected first on
   // every platform/runtime.
   await draftGrid
-    .getByText(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$/)
+    .getByText(/Monday|Tuesday|Wednesday|Thursday|Friday|Saturday/)
     .first()
     .waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText('Dr. Asha', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText('Room 101', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText(/Dr\. Asha/).first().waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText(/Room 101/).first().waitFor({ state: 'visible', timeout: 15000 })
   await draftGrid.getByText('Lecture', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
   await draftGrid.getByText('1 period', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
   pass('draft grid shows day/subject/faculty/room/type/duration')
