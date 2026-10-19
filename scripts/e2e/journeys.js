@@ -395,11 +395,18 @@ async function journeyA() {
   pass('run status is COMPLETED')
 
   // --- Review the draft grid ---
-  // Target the semantic tab rather than its text node. This avoids a
-  // platform-dependent Playwright hit target when the tab label is nested in
-  // the tablist alongside the active overview panel.
-  await page.getByRole('tab', { name: 'Draft Grid', exact: true }).click({ force: true })
   const draftGrid = page.getByTestId('draft-grid-scroll')
+  // Generation normally selects Draft Grid itself. If a platform/runtime
+  // paints the overview first, use its explicit action; the tab is a final
+  // fallback for older renderer timing.
+  if (!(await draftGrid.isVisible().catch(() => false))) {
+    const reviewDraft = page.getByRole('button', { name: 'Review Draft', exact: true })
+    if (await reviewDraft.isVisible().catch(() => false)) {
+      await reviewDraft.click({ force: true })
+    } else {
+      await page.getByRole('tab', { name: 'Draft Grid', exact: true }).click({ force: true })
+    }
+  }
   await draftGrid.waitFor({ state: 'visible', timeout: 15000 })
   // The deterministic solver may choose any configured working day; assert
   // the day header shape rather than assuming Monday is selected first on
