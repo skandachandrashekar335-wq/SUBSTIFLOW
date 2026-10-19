@@ -404,14 +404,19 @@ async function journeyA() {
   // The deterministic solver may choose any configured working day; assert
   // the day header shape rather than assuming Monday is selected first on
   // every platform/runtime.
-  await draftGrid
-    .getByText(/Monday|Tuesday|Wednesday|Thursday|Friday|Saturday/)
-    .first()
-    .waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText(/Dr\. Asha/).first().waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText(/Room 101/).first().waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText('Lecture', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
-  await draftGrid.getByText('1 period', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
+  const draftContentReady = await waitFor(async () => {
+    const text = (await draftGrid.innerText()).replace(/\s+/g, ' ')
+    return (
+      /Monday|Tuesday|Wednesday|Thursday|Friday|Saturday/.test(text) &&
+      /Dr\. Asha/.test(text) &&
+      /Room 101/.test(text) &&
+      /Lecture/i.test(text) &&
+      /1 period/.test(text)
+    )
+  }, 15000, 250)
+  if (!draftContentReady) {
+    throw new Error(`draft grid content did not become ready: ${JSON.stringify((await draftGrid.innerText()).slice(0, 500))}`)
+  }
   pass('draft grid shows day/subject/faculty/room/type/duration')
 
   // --- Independent validation ---
