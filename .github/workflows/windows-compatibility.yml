@@ -64,9 +64,8 @@ jobs:
         run: npm run build
 
       - name: Build Windows NSIS installer (npm run dist)
-        # electron-builder publishes nothing here: publishing only happens
-        # with an explicit `--publish` policy, which `npm run dist` does not
-        # pass, and no GH_TOKEN is provided to this job.
+        # The package script explicitly passes `--publish never`; this CI job
+        # only builds and uploads the installer as a workflow artifact.
         run: npm run dist
 
       - name: Verify the installer artifact exists and looks sane

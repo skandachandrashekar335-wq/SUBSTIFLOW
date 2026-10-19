@@ -42,9 +42,9 @@
     "predb:seed": "node scripts/ensure-abi.js electron",
     "db:seed": "npm run build:electron && electron scripts/cli.js seed",
     "predist": "node scripts/ensure-abi.js win32",
-    "dist": "npm run build && electron-builder --win --x64",
+    "dist": "npm run build && electron-builder --win --x64 --publish never",
     "predist:dir": "node scripts/ensure-abi.js win32",
-    "dist:dir": "npm run build && electron-builder --win --x64 --dir"
+    "dist:dir": "npm run build && electron-builder --win --x64 --dir --publish never"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1"
