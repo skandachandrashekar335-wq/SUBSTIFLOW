@@ -12,7 +12,7 @@ application on Windows.
 |---|---|---|
 | 1. Static inspection | Packaging config, runtime code, paths, native-module story reviewed for Windows portability | **Done** — findings below |
 | 2. Cross-packaging on macOS | `npm run dist` on the macOS dev host produces a real Windows NSIS installer | **Done** — verified today (`dist-electron/SubstiFlow-Setup.exe`, 83,617,673 bytes, PE32 NSIS; `win-unpacked/` inspected — `app.asar` 1.6 MB with only `better-sqlite3` + its chain, native module is PE32+) |
-| 3. Windows runner automation | `.github/workflows/windows-compatibility.yml` runs install → tests → typechecks → build → NSIS package → artifact upload on `windows-latest`, plus an experimental GUI smoke job | **Prepared, not yet executed** — the workflow files are local and uncommitted; nothing has run on a hosted Windows runner |
+| 3. Windows runner automation | `.github/workflows/windows-compatibility.yml` runs install → tests → typechecks → build → NSIS package → artifact upload on a pinned `windows-2022` image, plus an experimental GUI smoke job | **In progress** — macOS CI is green; hosted Windows runs reached native setup but the prior `windows-latest`/VS 2026 image was incompatible with Electron 31's node-gyp, so the workflow is now pinned to `windows-2022` and needs a fresh run |
 | 4. Manual desktop test | A person installs and uses the packaged app on an actual Windows machine | **Not done** — required before claiming Windows support |
 
 Until levels 3 and 4 have actually happened on Windows, Windows compatibility
@@ -164,4 +164,4 @@ pipeline, not the runtime.
 | `npm test` | macOS host | 250/250 passing |
 | `npm run e2e` | macOS host | 118/118 checks PASS incl. journey H (with publish) + offline assertion + sidebar main-process-version check |
 | spaced-path launch (ad-hoc script, isolated temp dir) | macOS host | PASS — DB created, schema v8, wizard rendered |
-| `windows-compatibility.yml` | windows-latest | first hosted run reached clean install but failed in the old postinstall/node-gyp path; workflow now uses `npm ci --ignore-scripts` plus prebuild-first ABI preparation and requires a fresh hosted run |
+| `windows-compatibility.yml` | windows-2022 | hosted `windows-latest` currently resolves to a VS 2026 image that Electron 31's node-gyp cannot identify; the workflow is pinned to the VS 2022 image and uses `npm ci --ignore-scripts` plus prebuild-first ABI preparation; a fresh hosted run is required |

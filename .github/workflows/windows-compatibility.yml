@@ -25,7 +25,10 @@ on: [push, pull_request]
 jobs:
   windows-verify:
     name: Windows install, test, typecheck, build, NSIS package
-    runs-on: windows-latest
+    # Pin the image while node-gyp/better-sqlite3 still needs the VS 2022
+    # toolchain. `windows-latest` moved to the VS 2026 image, whose major is
+    # not recognised by the Electron node-gyp bundled with Electron 31.
+    runs-on: windows-2022
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +104,7 @@ jobs:
     name: Windows GUI runtime smoke (experimental)
     needs: windows-verify
     continue-on-error: true
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
