@@ -61,15 +61,18 @@ export function productionDataDir(
   home: string = os.homedir()
 ): string {
   if (platform === 'darwin') {
-    return path.join(home, 'Library', 'Application Support', 'SubstiFlow')
+    return path.posix.join(home, 'Library', 'Application Support', 'SubstiFlow')
   }
   if (platform === 'win32') {
     const appData = env.APPDATA
-    if (appData && appData.length > 0) return path.join(appData, 'SubstiFlow')
-    return path.join(home, 'AppData', 'Roaming', 'SubstiFlow')
+    if (appData && appData.length > 0) return path.win32.join(appData, 'SubstiFlow')
+    return path.win32.join(home, 'AppData', 'Roaming', 'SubstiFlow')
   }
   const xdg = env.XDG_CONFIG_HOME
-  return path.join(xdg && xdg.length > 0 ? xdg : path.join(home, '.config'), 'SubstiFlow')
+  return path.posix.join(
+    xdg && xdg.length > 0 ? xdg : path.posix.join(home, '.config'),
+    'SubstiFlow'
+  )
 }
 
 /** True when `child` is `parent` itself or lives inside it. Pure function. */

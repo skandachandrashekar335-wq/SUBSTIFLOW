@@ -62,8 +62,10 @@ vi.mock('@/db/database', () => ({
 describe('demo path isolation', () => {
   it('resolves the demo database inside <root>/.substiflow-demo/database', () => {
     const p = resolveDemoPaths('/tmp/some-repo')
-    expect(p.demoDir).toBe(path.join('/tmp/some-repo', DEMO_DIR_NAME))
-    expect(p.dbPath).toBe(path.join('/tmp/some-repo', DEMO_DIR_NAME, 'database', 'substiflow.db'))
+    expect(p.demoDir).toBe(path.resolve('/tmp/some-repo', DEMO_DIR_NAME))
+    expect(p.dbPath).toBe(
+      path.resolve('/tmp/some-repo', DEMO_DIR_NAME, 'database', 'substiflow.db')
+    )
   })
 
   it('maps the production data directory per platform', () => {
@@ -71,7 +73,7 @@ describe('demo path isolation', () => {
       '/Users/x/Library/Application Support/SubstiFlow'
     )
     expect(productionDataDir({ APPDATA: 'C:\\Roaming' }, 'win32', 'C:\\Users\\x')).toBe(
-      path.join('C:\\Roaming', 'SubstiFlow')
+      path.win32.join('C:\\Roaming', 'SubstiFlow')
     )
     expect(productionDataDir({}, 'linux', '/home/x')).toBe('/home/x/.config/SubstiFlow')
     expect(productionDataDir({ XDG_CONFIG_HOME: '/custom' }, 'linux', '/home/x')).toBe(
