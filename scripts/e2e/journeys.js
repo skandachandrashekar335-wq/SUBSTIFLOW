@@ -395,7 +395,10 @@ async function journeyA() {
   pass('run status is COMPLETED')
 
   // --- Review the draft grid ---
-  await page.getByText('Draft Grid', { exact: true }).click()
+  // Target the semantic tab rather than its text node. This avoids a
+  // platform-dependent Playwright hit target when the tab label is nested in
+  // the tablist alongside the active overview panel.
+  await page.getByRole('tab', { name: 'Draft Grid', exact: true }).click()
   await waitText('Monday')
   await waitText('Dr. Asha')
   await waitText('Room 101')
