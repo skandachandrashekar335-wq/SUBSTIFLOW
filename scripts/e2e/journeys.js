@@ -399,11 +399,19 @@ async function journeyA() {
   // platform-dependent Playwright hit target when the tab label is nested in
   // the tablist alongside the active overview panel.
   await page.getByRole('tab', { name: 'Draft Grid', exact: true }).click({ force: true })
-  await waitText('Monday')
-  await waitText('Dr. Asha')
-  await waitText('Room 101')
-  await waitText('Lecture')
-  await waitText('1 period')
+  const draftGrid = page.getByTestId('draft-grid-scroll')
+  await draftGrid.waitFor({ state: 'visible', timeout: 15000 })
+  // The deterministic solver may choose any configured working day; assert
+  // the day header shape rather than assuming Monday is selected first on
+  // every platform/runtime.
+  await draftGrid
+    .getByText(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$/)
+    .first()
+    .waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText('Dr. Asha', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText('Room 101', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText('Lecture', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
+  await draftGrid.getByText('1 period', { exact: true }).first().waitFor({ state: 'visible', timeout: 15000 })
   pass('draft grid shows day/subject/faculty/room/type/duration')
 
   // --- Independent validation ---
