@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '@/stores/appStore'
-import { facultyRepository, sectionRepository, subjectRepository } from '@/db/repositories'
+import { facultyRepository, sectionRepository, subjectRepository, subjectRequirementRepository } from '@/db/repositories'
 import {
   createTeachingAllocation,
   updateTeachingAllocation,
@@ -11,7 +11,7 @@ import {
   getAllocationsGroupedBySectionSubject,
 } from '@/services/timetableGeneration'
 import { ClassType } from '@/types'
-import { weeklySessionCounter } from '@/utils/weeklyCapacity'
+import { calculateSectionCapacities } from '@/utils/weeklyCapacity'
 import { Button } from '@/components/ui/Button'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
 import { Dialog } from '@/components/ui/Dialog'
@@ -32,7 +32,7 @@ const emptyFormData = {
   facultyId: '',
   sectionId: '',
   subjectId: '',
-  classType: 'LECTURE' as any,
+  classType: 'LECTURE' as ClassType,
   requiredSessionsPerWeek: 1,
 }
 
@@ -40,6 +40,7 @@ export function TeachingAllocations() {
   const { currentAcademicYear } = useAppStore()
   const [allocations, setAllocations] = useState<any[]>([])
   const [groupedAllocations, setGroupedAllocations] = useState<any[]>([])
+  const [selectedSectionId, setSelectedSectionId] = useState<string>('')
   const [showForm, setShowForm] = useState(false)
   const [editingAllocation, setEditingAllocation] = useState<any | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
@@ -49,11 +50,18 @@ export function TeachingAllocations() {
   // Only teaching staff may hold allocations — non-teaching staff are filtered
   // out here and refused again in the service layer.
   const faculty = useMemo(
-    () => facultyRepository.findActive().filter(f => f.staffType === 'TEACHING'),
+    () => facultyRepository.findActive().filter((f) => f.staffType === 'TEACHING'),
     []
   )
-  const sections = useMemo(() => currentAcademicYear ? sectionRepository.findByAcademicYear(currentAcademicYear.id) : [], [currentAcademicYear])
+  const sections = useMemo(
+    () => (currentAcademicYear ? sectionRepository.findByAcademicYear(currentAcademicYear.id) : []),
+    [currentAcademicYear]
+  )
   const subjects = useMemo(() => subjectRepository.findAll(), [])
+  const requirements = useMemo(
+    () => (currentAcademicYear ? subjectRequirementRepository.findByAcademicYear(currentAcademicYear.id) : []),
+    [currentAcademicYear, allocations]
+  )
   const currentYear = currentAcademicYear?.name || '—'
 
   useEffect(() => {
@@ -69,6 +77,42 @@ export function TeachingAllocations() {
     setGroupedAllocations(getAllocationsGroupedBySectionSubject(currentAcademicYear.id))
   }
 
+  // Section-wise capacity calculation (distinguishes sessions from span-weighted periods)
+  const capacitySummary = useMemo(() => {
+    return calculateSectionCapacities({
+      sections,
+      requirements,
+      allocations,
+    })
+  }, [sections, requirements, allocations])
+
+  const activeSectionCapacity = useMemo(() => {
+    if (!selectedSectionId) return null
+    return capacitySummary.sections.find((s) => s.sectionId === selectedSectionId) ?? null
+  }, [capacitySummary, selectedSectionId])
+
+  // Filtered grouped allocations
+  const displayedGroups = useMemo(() => {
+    if (!selectedSectionId) return groupedAllocations
+    return groupedAllocations.filter((g) => g.sectionId === selectedSectionId)
+  }, [groupedAllocations, selectedSectionId])
+
+  // Section requirement completeness check
+  const sectionCompleteness = useMemo(() => {
+    if (!selectedSectionId) return null
+    const secReqs = requirements.filter((r) => r.sectionId === selectedSectionId)
+    const secAllocs = allocations.filter((a) => a.sectionId === selectedSectionId)
+    const coveredReqs = secReqs.filter((r) =>
+      secAllocs.some((a) => a.subjectId === r.subjectId && a.classType === r.classType)
+    )
+    return {
+      total: secReqs.length,
+      allocated: coveredReqs.length,
+      isComplete: secReqs.length > 0 && coveredReqs.length >= secReqs.length,
+      missingCount: secReqs.length - coveredReqs.length,
+    }
+  }, [selectedSectionId, requirements, allocations])
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -80,7 +124,7 @@ export function TeachingAllocations() {
       }
       setShowForm(false)
       setEditingAllocation(null)
-      setFormData(emptyFormData)
+      setFormData({ ...emptyFormData, sectionId: selectedSectionId || '' })
       loadAllocations()
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'An error occurred')
@@ -101,7 +145,6 @@ export function TeachingAllocations() {
     }
   }
 
-  /** Delete EVERY allocation of one activity (the grouped row's trash button). */
   const handleDeleteGroup = (group: any) => {
     const count = group.faculty.length
     const message =
@@ -139,30 +182,26 @@ export function TeachingAllocations() {
 
   const handleNew = () => {
     setEditingAllocation(null)
-    setFormData(emptyFormData)
+    setFormData({
+      ...emptyFormData,
+      sectionId: selectedSectionId || (sections[0]?.id ?? ''),
+    })
     setShowForm(true)
   }
 
   const handleCancel = () => {
     setShowForm(false)
     setEditingAllocation(null)
-    setFormData(emptyFormData)
+    setFormData({ ...emptyFormData, sectionId: selectedSectionId || '' })
     setFormError(null)
   }
 
-  // The real solver lives on the Timetable Generation page (draft → validate →
-  // publish). This button just takes the coordinator there with the allocations
-  // they just reviewed.
   const navigate = useNavigate()
   const handleGenerate = () => navigate('/generation')
 
-  const totalRequiredSessions = groupedAllocations.reduce((sum, g) => sum + g.totalRequiredSessions, 0)
-  const totalFaculty = new Set(allocations.map(a => a.facultyId)).size
-  const totalSections = new Set(allocations.map(a => a.sectionId)).size
-  // Weekly counter: allocated sessions/week from the persisted allocation
-  // rows (each teacher's own row counts once; requirements are not added on
-  // top, so shared activities are never double-counted).
-  const sessionCounter = weeklySessionCounter(allocations)
+  const totalRequiredSessions = capacitySummary.totalAllocatedSessions
+  const totalFaculty = new Set(allocations.map((a) => a.facultyId)).size
+  const totalSections = new Set(allocations.map((a) => a.sectionId)).size
 
   return (
     <div className="space-y-6">
@@ -170,15 +209,21 @@ export function TeachingAllocations() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-secondary-900">Teaching Allocations</h1>
-          <p className="text-secondary-600 mt-1">Academic Year: <span className="font-medium">{currentYear}</span></p>
+          <p className="text-secondary-600 mt-1">
+            Academic Year: <span className="font-medium">{currentYear}</span>
+          </p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" onClick={handleNew}>
-            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4"></path></svg>
+            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
             Add Allocation
           </Button>
           <Button onClick={handleGenerate}>
-            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
             Generate Timetable
           </Button>
         </div>
@@ -195,65 +240,187 @@ export function TeachingAllocations() {
         <Card className="border-secondary-200">
           <CardBody className="p-4">
             <div className="text-2xl font-bold text-secondary-700">{totalRequiredSessions}</div>
-            <div className="text-sm text-secondary-600">Sessions/Week Required</div>
+            <div className="text-sm text-secondary-600">Weekly Sessions</div>
           </CardBody>
         </Card>
         <Card className="border-secondary-200">
           <CardBody className="p-4">
-            <div className="text-2xl font-bold text-secondary-700">{totalFaculty}</div>
-            <div className="text-sm text-secondary-600">Faculty Members</div>
+            <div className="text-2xl font-bold text-secondary-700">{capacitySummary.totalAllocatedPeriods} / {capacitySummary.totalCapacity}</div>
+            <div className="text-sm text-secondary-600">Occupied Periods ({capacitySummary.utilizationPercent}%)</div>
           </CardBody>
         </Card>
         <Card className="border-secondary-200">
           <CardBody className="p-4">
-            <div className="text-2xl font-bold text-secondary-700">{totalSections}</div>
-            <div className="text-sm text-secondary-600">Sections</div>
+            <div className="text-2xl font-bold text-secondary-700">{totalFaculty} / {totalSections}</div>
+            <div className="text-sm text-secondary-600">Faculty / Sections</div>
           </CardBody>
         </Card>
       </div>
 
-      {/* Help/Info */}
-      <div className="p-4 text-sm text-info-800 bg-info-50 border border-info-200 rounded-lg flex items-start gap-3">
-        <svg className="h-5 w-5 text-info-600 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        <div className="text-sm text-info-800 space-y-1">
-          <p className="font-medium">How Teaching Allocations Work</p>
-          <ul className="list-disc list-inside space-y-1 text-sm">
-            <li>Each row defines: <strong>Faculty</strong> teaches <strong>Subject</strong> to <strong>Section</strong> as <strong>Type</strong>, <strong>N sessions/week</strong></li>
-            <li>For <strong>Labs</strong> requiring multiple faculty: add <strong>multiple rows</strong> with same Section+Subject+Type, different Faculty</li>
-            <li>Required sessions = total sessions needed per week across all faculty for that Section+Subject+Type</li>
-            <li>The generator will schedule exactly this many sessions per week</li>
-          </ul>
-        </div>
-      </div>
+      {/* Section-Wise Capacity Summary Card */}
+      <Card>
+        <CardHeader className="p-4 border-b border-secondary-200">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-lg font-semibold text-secondary-900">Section-Wise Timetable Capacity</h3>
+              <p className="text-xs text-secondary-500 mt-0.5">
+                Each section has 36 teaching periods/week (6 days × 6 periods). Total capacity: {capacitySummary.totalCapacity} periods across {sections.length} sections.
+              </p>
+            </div>
+            <div className="text-sm font-medium text-secondary-700">
+              Aggregate: <span className="font-semibold text-primary-700">{capacitySummary.totalAllocatedPeriods}</span> / {capacitySummary.totalCapacity} periods ({capacitySummary.remainingPeriods} free)
+            </div>
+          </div>
+        </CardHeader>
+        <CardBody className="p-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {capacitySummary.sections.map((sec) => {
+              const isSelected = selectedSectionId === sec.sectionId
+              return (
+                <div
+                  key={sec.sectionId}
+                  onClick={() => setSelectedSectionId(isSelected ? '' : sec.sectionId)}
+                  className={`cursor-pointer rounded-lg border p-3 transition-all ${
+                    isSelected
+                      ? 'border-primary-500 bg-primary-50/60 shadow-sm ring-1 ring-primary-500'
+                      : 'border-secondary-200 bg-white hover:border-secondary-300 hover:bg-secondary-50/50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="font-semibold text-secondary-900 text-sm">{sec.sectionName}</span>
+                    <span className="text-xs text-secondary-500">Sem {sec.semester}</span>
+                  </div>
+                  <div className="flex items-baseline justify-between text-xs mb-1">
+                    <span className="text-secondary-600">
+                      <strong className={sec.isOverCapacity ? 'text-red-600 font-bold' : 'text-secondary-900'}>
+                        {sec.allocatedPeriods}
+                      </strong>{' '}
+                      / {sec.weeklyCapacity} periods
+                    </span>
+                    <span className={sec.isOverCapacity ? 'text-red-600 font-medium' : 'text-secondary-500'}>
+                      {sec.isOverCapacity ? `+${sec.exceededBy} over` : `${sec.remainingPeriods} remaining`}
+                    </span>
+                  </div>
+                  {/* Progress bar */}
+                  <div className="w-full h-2 bg-secondary-100 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full transition-all duration-300 rounded-full ${
+                        sec.isOverCapacity
+                          ? 'bg-red-500'
+                          : sec.utilizationPercent >= 75
+                            ? 'bg-primary-600'
+                            : 'bg-primary-500'
+                      }`}
+                      style={{ width: `${Math.min(100, sec.utilizationPercent)}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-secondary-400 mt-1.5">
+                    <span>{sec.allocatedSessions} weekly sessions</span>
+                    <span>{sec.utilizationPercent}% load</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </CardBody>
+      </Card>
 
       {/* Grouped Allocations Table */}
       <Card>
         <CardHeader className="p-4 border-b border-secondary-200">
-          {/* Title left, weekly counter right; wraps on narrow windows
-              instead of overlapping. */}
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
-            <h3 className="text-lg font-semibold text-secondary-900">Allocations by Section & Subject</h3>
-            <div className="flex items-baseline gap-x-2 text-sm" data-testid="weekly-session-counter">
-              <span className={sessionCounter.exceededBy ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
-                {sessionCounter.allocated} / {sessionCounter.capacity}
-              </span>
-              <span className="text-secondary-500">sessions/week</span>
-              {sessionCounter.exceededBy ? (
-                <span className="font-medium text-danger-600">capacity exceeded (+{sessionCounter.exceededBy})</span>
-              ) : (
-                <>
-                  <span className="text-secondary-300" aria-hidden="true">·</span>
-                  <span className="text-secondary-500">{sessionCounter.remaining} remaining</span>
-                </>
-              )}
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+              <div>
+                <h3 className="text-lg font-semibold text-secondary-900">
+                  {selectedSectionId
+                    ? `Allocations for ${sections.find((s) => s.id === selectedSectionId)?.name ?? 'Selected Section'}`
+                    : 'Allocations by Section & Subject'}
+                </h3>
+                {selectedSectionId && sectionCompleteness && (
+                  <p className="text-xs text-secondary-500 mt-0.5">
+                    {sectionCompleteness.isComplete ? (
+                      <span className="text-green-700 font-medium">✓ All {sectionCompleteness.total} required curriculum subjects allocated</span>
+                    ) : (
+                      <span className="text-amber-700 font-medium">⚠ {sectionCompleteness.missingCount} of {sectionCompleteness.total} subjects missing teaching allocation</span>
+                    )}
+                  </p>
+                )}
+              </div>
+
+              {/* Weekly counter in header with data-testid for compatibility */}
+              <div className="flex items-baseline gap-x-2 text-sm" data-testid="weekly-session-counter">
+                {activeSectionCapacity ? (
+                  <>
+                    <span className={activeSectionCapacity.isOverCapacity ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
+                      {activeSectionCapacity.allocatedPeriods} / {activeSectionCapacity.weeklyCapacity}
+                    </span>
+                    <span className="text-secondary-500">periods/week</span>
+                    {activeSectionCapacity.isOverCapacity ? (
+                      <span className="font-medium text-danger-600">capacity exceeded (+{activeSectionCapacity.exceededBy})</span>
+                    ) : (
+                      <>
+                        <span className="text-secondary-300" aria-hidden="true">·</span>
+                        <span className="text-secondary-500">{activeSectionCapacity.remainingPeriods} remaining ({activeSectionCapacity.allocatedSessions} sessions)</span>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <span className={capacitySummary.isOverCapacity ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
+                      {capacitySummary.totalAllocatedPeriods} / {capacitySummary.totalCapacity}
+                    </span>
+                    <span className="text-secondary-500">periods/week</span>
+                    {capacitySummary.isOverCapacity ? (
+                      <span className="font-medium text-danger-600">capacity exceeded (+{capacitySummary.exceededBy})</span>
+                    ) : (
+                      <>
+                        <span className="text-secondary-300" aria-hidden="true">·</span>
+                        <span className="text-secondary-500">{capacitySummary.remainingPeriods} remaining ({capacitySummary.totalAllocatedSessions} sessions)</span>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Section Filter Pills / Selector */}
+            <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-secondary-100">
+              <span className="text-xs font-medium text-secondary-500 mr-1">Filter section:</span>
+              <button
+                type="button"
+                onClick={() => setSelectedSectionId('')}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                  selectedSectionId === ''
+                    ? 'bg-secondary-900 text-white'
+                    : 'bg-secondary-100 text-secondary-700 hover:bg-secondary-200'
+                }`}
+              >
+                All Sections ({sections.length})
+              </button>
+              {sections.map((sec) => (
+                <button
+                  key={sec.id}
+                  type="button"
+                  onClick={() => setSelectedSectionId(sec.id)}
+                  className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                    selectedSectionId === sec.id
+                      ? 'bg-primary-600 text-white'
+                      : 'bg-secondary-100 text-secondary-700 hover:bg-secondary-200'
+                  }`}
+                >
+                  {sec.name}
+                </button>
+              ))}
             </div>
           </div>
         </CardHeader>
         <CardBody className="p-0">
-          {groupedAllocations.length === 0 ? (
+          {displayedGroups.length === 0 ? (
             <div className="p-8 text-center text-secondary-500">
-              <p className="text-lg font-medium text-secondary-700 mb-2">No teaching allocations yet</p>
-              <p className="text-secondary-500">Click "Add Allocation" to define teaching assignments</p>
+              <p className="text-lg font-medium text-secondary-700 mb-2">No teaching allocations found</p>
+              <p className="text-secondary-500">
+                {selectedSectionId ? 'No allocations for this section yet.' : 'Click "Add Allocation" to define teaching assignments.'}
+              </p>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -269,15 +436,22 @@ export function TeachingAllocations() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {groupedAllocations.map((group, index) => (
-                    <TableRow key={`${group.sectionId}-${group.subjectId}-${group.classType}`} className={index % 2 === 0 ? 'bg-white' : 'bg-secondary-50/50'}>
+                  {displayedGroups.map((group, index) => (
+                    <TableRow
+                      key={`${group.sectionId}-${group.subjectId}-${group.classType}`}
+                      className={index % 2 === 0 ? 'bg-white' : 'bg-secondary-50/50'}
+                    >
                       <TableCell className="font-medium">
                         <div>{group.sectionName}</div>
                         <div className="text-xs text-secondary-500">Semester {group.semester}</div>
                       </TableCell>
                       <TableCell>{group.subjectName}</TableCell>
                       <TableCell>
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${group.classType === 'LAB' ? 'bg-primary-100 text-primary-800' : 'bg-secondary-100 text-secondary-800'}`}>
+                        <span
+                          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                            group.classType === 'LAB' ? 'bg-primary-100 text-primary-800' : 'bg-secondary-100 text-secondary-800'
+                          }`}
+                        >
                           {group.classType}
                         </span>
                       </TableCell>
@@ -285,37 +459,37 @@ export function TeachingAllocations() {
                         {group.totalRequiredSessions} / week
                       </TableCell>
                       <TableCell className="whitespace-nowrap">
-                        {/* Plain stacked text, one teacher per line. A former
-                            rounded-full pill shrank to the column's minimum
-                            (longest word) and wrapped the name INSIDE the grey
-                            bubble, which made the table look broken. */}
                         <div className="space-y-0.5 leading-normal">
                           {group.faculty.map((f: any) => (
-                            <div key={f.allocationId}>{f.name} ({f.requiredSessions})</div>
+                            <div key={f.allocationId}>
+                              {f.name} ({f.requiredSessions})
+                            </div>
                           ))}
                         </div>
                       </TableCell>
                       <TableCell>
-                        {/* nowrap keeps every action icon on ONE row; the table
-                            wrapper scrolls horizontally on narrow windows. */}
                         <div className="flex items-center gap-1.5 whitespace-nowrap">
                           {group.faculty.map((f: any) => (
                             <div key={f.allocationId} className="flex items-center gap-1.5">
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                onClick={() => handleEdit({
-                                  id: f.allocationId,
-                                  facultyId: f.id,
-                                  sectionId: group.sectionId,
-                                  subjectId: group.subjectId,
-                                  classType: group.classType,
-                                  requiredSessionsPerWeek: f.requiredSessions,
-                                })}
+                                onClick={() =>
+                                  handleEdit({
+                                    id: f.allocationId,
+                                    facultyId: f.id,
+                                    sectionId: group.sectionId,
+                                    subjectId: group.subjectId,
+                                    classType: group.classType,
+                                    requiredSessionsPerWeek: f.requiredSessions,
+                                  })
+                                }
                                 title={`Edit ${f.name}'s allocation`}
                                 aria-label={`Edit ${f.name}'s allocation`}
                               >
-                                <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                </svg>
                               </Button>
                               <Button
                                 variant="ghost"
@@ -326,15 +500,12 @@ export function TeachingAllocations() {
                                 title={`Delete ${f.name}'s allocation`}
                                 aria-label={`Delete ${f.name}'s allocation`}
                               >
-                                <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
                               </Button>
                             </div>
                           ))}
-                          {/* The group ("delete all") button only exists when
-                              there is something extra to delete: with a single
-                              teacher it performed the exact same operation as
-                              that teacher's own delete button, rendering a
-                              confusing second trash icon. */}
                           {group.faculty.length > 1 && (
                             <Button
                               variant="ghost"
@@ -345,7 +516,9 @@ export function TeachingAllocations() {
                               title="Delete all allocations for this Section+Subject+Type"
                               aria-label="Delete all allocations for this Section+Subject+Type"
                             >
-                              <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                              <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                              </svg>
                             </Button>
                           )}
                         </div>
@@ -376,7 +549,9 @@ export function TeachingAllocations() {
               className="p-1.5 rounded-lg text-secondary-500 hover:bg-secondary-100 transition-colors"
               aria-label="Close dialog"
             >
-              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"></path></svg>
+              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
             </button>
           </div>
           <form onSubmit={handleSubmit} className="space-y-4 p-6">
@@ -389,13 +564,15 @@ export function TeachingAllocations() {
               <label className="block text-sm font-medium text-secondary-700 mb-1">Faculty *</label>
               <select
                 value={formData.facultyId}
-                onChange={(e) => setFormData({...formData, facultyId: e.target.value})}
+                onChange={(e) => setFormData({ ...formData, facultyId: e.target.value })}
                 className="w-full rounded-lg border px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 border-secondary-300"
                 required
               >
                 <option value="">Select faculty</option>
-                {faculty.map(f => (
-                  <option key={f.id} value={f.id}>{f.name} ({f.departmentId})</option>
+                {faculty.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name} ({f.departmentId})
+                  </option>
                 ))}
               </select>
             </div>
@@ -403,13 +580,15 @@ export function TeachingAllocations() {
               <label className="block text-sm font-medium text-secondary-700 mb-1">Section / Class *</label>
               <select
                 value={formData.sectionId}
-                onChange={(e) => setFormData({...formData, sectionId: e.target.value})}
+                onChange={(e) => setFormData({ ...formData, sectionId: e.target.value })}
                 className="w-full rounded-lg border px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 border-secondary-300"
                 required
               >
                 <option value="">Select section</option>
-                {sections.map(s => (
-                  <option key={s.id} value={s.id}>{s.name} (Sem {s.semester})</option>
+                {sections.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} (Sem {s.semester})
+                  </option>
                 ))}
               </select>
             </div>
@@ -417,13 +596,15 @@ export function TeachingAllocations() {
               <label className="block text-sm font-medium text-secondary-700 mb-1">Subject *</label>
               <select
                 value={formData.subjectId}
-                onChange={(e) => setFormData({...formData, subjectId: e.target.value})}
+                onChange={(e) => setFormData({ ...formData, subjectId: e.target.value })}
                 className="w-full rounded-lg border px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 border-secondary-300"
                 required
               >
                 <option value="">Select subject</option>
-                {subjects.map(s => (
-                  <option key={s.id} value={s.id}>{s.name} ({s.code})</option>
+                {subjects.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.code})
+                  </option>
                 ))}
               </select>
             </div>
@@ -432,12 +613,14 @@ export function TeachingAllocations() {
                 <label className="block text-sm font-medium text-secondary-700 mb-1">Class Type *</label>
                 <select
                   value={formData.classType}
-                  onChange={(e) => setFormData({...formData, classType: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, classType: e.target.value as ClassType })}
                   className="w-full rounded-lg border px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 border-secondary-300"
                   required
                 >
-                  {CLASS_TYPES.map(c => (
-                    <option key={c.value} value={c.value}>{c.label}</option>
+                  {CLASS_TYPES.map((c) => (
+                    <option key={c.value} value={c.value}>
+                      {c.label}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -448,17 +631,27 @@ export function TeachingAllocations() {
                   min="1"
                   max="10"
                   value={formData.requiredSessionsPerWeek}
-                  onChange={e => setFormData({...formData, requiredSessionsPerWeek: parseInt(e.target.value) || 1})}
+                  onChange={(e) =>
+                    setFormData({ ...formData, requiredSessionsPerWeek: parseInt(e.target.value, 10) || 1 })
+                  }
                   className="w-full rounded-lg border px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 border-secondary-300"
                   required
                 />
               </div>
             </div>
             <div className="flex items-center justify-end gap-2 pt-4 border-t border-secondary-200">
-              <button type="button" onClick={handleCancel} className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-secondary-700 bg-white border border-secondary-300 rounded-lg hover:bg-secondary-50 transition-colors">
+              <button
+                type="button"
+                onClick={handleCancel}
+                className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-secondary-700 bg-white border border-secondary-300 rounded-lg hover:bg-secondary-50 transition-colors"
+              >
                 Cancel
               </button>
-              <button type="submit" disabled={deletingId !== null} className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-primary-600 border border-transparent rounded-lg hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed">
+              <button
+                type="submit"
+                disabled={deletingId !== null}
+                className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-primary-600 border border-transparent rounded-lg hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
                 {editingAllocation ? 'Update' : 'Create'}
               </button>
             </div>

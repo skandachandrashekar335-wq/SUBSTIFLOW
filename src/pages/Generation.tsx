@@ -12,6 +12,9 @@ import {
   AlertTriangle,
   Trash2,
   Upload,
+  GripVertical,
+  Undo2,
+  ArrowLeftRight,
 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { parseDbTimestamp } from '@/utils/date'
@@ -36,6 +39,8 @@ import {
   getGenerationStatus,
   deleteGeneration,
   recoverStaleGenerations,
+  moveDraftEntry,
+  swapDraftEntries,
 } from '@/services/timetableGenerator'
 import { resolveCoveredSlots } from '@/services/timetable'
 import {
@@ -71,9 +76,39 @@ export function Generation() {
   const [publishDialogOpen, setPublishDialogOpen] = useState(false)
   const [deleteDialogId, setDeleteDialogId] = useState<string | null>(null)
 
+  // Draft editing state (drag & drop, accessible move/swap, undo history)
+  const [moveDialogOpen, setMoveDialogOpen] = useState(false)
+  const [moveTargetEntry, setMoveTargetEntry] = useState<DraftTimetableEntryWithRelations | null>(null)
+  const [selectedMoveDay, setSelectedMoveDay] = useState<DayOfWeek>('MONDAY')
+  const [selectedMoveSlotId, setSelectedMoveSlotId] = useState<string>('')
+  const [selectedSwapEntryId, setSelectedSwapEntryId] = useState<string>('')
+  const [moveMode, setMoveMode] = useState<'move' | 'swap'>('move')
+  const [moveError, setMoveError] = useState<string | null>(null)
+  const [editHistory, setEditHistory] = useState<
+    Array<{
+      type: 'move' | 'swap'
+      entryIdA: string
+      dayA: DayOfWeek
+      slotIdA: string
+      entryIdB?: string
+      dayB?: DayOfWeek
+      slotIdB?: string
+      desc: string
+    }>
+  >([])
+
   const activeGeneration = useMemo(
     () => generations.find((g) => g.id === activeGenerationId) ?? null,
     [generations, activeGenerationId]
+  )
+
+  const isPublished = useMemo(
+    () => statusInfo?.published === true,
+    [statusInfo]
+  )
+  const isEditable = useMemo(
+    () => !isPublished && activeGeneration?.status === 'COMPLETED',
+    [isPublished, activeGeneration]
   )
 
   const loadGenerations = useCallback(() => {
@@ -93,6 +128,117 @@ export function Generation() {
     // Independent validation pass — recomputed from scratch on every view.
     setValidationResult(validateDraftTimetable(generationId))
   }, [])
+
+  const handleMove = useCallback(
+    (entryId: string, targetDay: DayOfWeek, targetSlotId: string) => {
+      if (!activeGenerationId) return
+      const entry = draftEntries.find((e) => e.id === entryId)
+      if (!entry) return
+      if (entry.dayOfWeek === targetDay && entry.timeSlotId === targetSlotId) return
+
+      const prevDay = entry.dayOfWeek
+      const prevSlotId = entry.timeSlotId
+
+      const res = moveDraftEntry(activeGenerationId, entryId, targetDay, targetSlotId)
+      if (!res.success) {
+        setError(res.error || 'Could not move session.')
+        return
+      }
+
+      setEditHistory((prev) => [
+        {
+          type: 'move',
+          entryIdA: entryId,
+          dayA: prevDay,
+          slotIdA: prevSlotId,
+          desc: `Moved ${entry.subject?.name ?? 'session'} to ${targetDay}`,
+        },
+        ...prev.slice(0, 19),
+      ])
+
+      // Invalidate previous validation status
+      setValidationResult(null)
+      setError(null)
+      setNotice(
+        `Moved ${entry.subject?.name ?? 'session'} to ${targetDay}. Previous validation cleared — re-run validation before publishing.`
+      )
+      loadGenerationDetails(activeGenerationId)
+    },
+    [activeGenerationId, draftEntries, loadGenerationDetails]
+  )
+
+  const handleSwap = useCallback(
+    (entryIdA: string, entryIdB: string) => {
+      if (!activeGenerationId) return
+      if (entryIdA === entryIdB) return
+      const entryA = draftEntries.find((e) => e.id === entryIdA)
+      const entryB = draftEntries.find((e) => e.id === entryIdB)
+      if (!entryA || !entryB) return
+
+      const prevDayA = entryA.dayOfWeek
+      const prevSlotA = entryA.timeSlotId
+      const prevDayB = entryB.dayOfWeek
+      const prevSlotB = entryB.timeSlotId
+
+      const res = swapDraftEntries(activeGenerationId, entryIdA, entryIdB)
+      if (!res.success) {
+        setError(res.error || 'Could not swap sessions.')
+        return
+      }
+
+      setEditHistory((prev) => [
+        {
+          type: 'swap',
+          entryIdA,
+          dayA: prevDayA,
+          slotIdA: prevSlotA,
+          entryIdB,
+          dayB: prevDayB,
+          slotIdB: prevSlotB,
+          desc: `Swapped ${entryA.subject?.name ?? 'class'} and ${entryB.subject?.name ?? 'class'}`,
+        },
+        ...prev.slice(0, 19),
+      ])
+
+      // Invalidate previous validation status
+      setValidationResult(null)
+      setError(null)
+      setNotice(
+        `Swapped ${entryA.subject?.name ?? 'class'} and ${entryB.subject?.name ?? 'class'}. Previous validation cleared — re-run validation before publishing.`
+      )
+      loadGenerationDetails(activeGenerationId)
+    },
+    [activeGenerationId, draftEntries, loadGenerationDetails]
+  )
+
+  const handleUndo = useCallback(() => {
+    if (!activeGenerationId || editHistory.length === 0) return
+    const [lastEdit, ...rest] = editHistory
+
+    if (lastEdit.type === 'move') {
+      const res = moveDraftEntry(activeGenerationId, lastEdit.entryIdA, lastEdit.dayA, lastEdit.slotIdA)
+      if (res.success) {
+        setEditHistory(rest)
+        setValidationResult(null)
+        setError(null)
+        setNotice(`Undid last move: restored session to ${lastEdit.dayA}. Re-run validation before publishing.`)
+        loadGenerationDetails(activeGenerationId)
+      } else {
+        setError(`Could not undo move: ${res.error}`)
+      }
+    } else if (lastEdit.type === 'swap' && lastEdit.entryIdB) {
+      const res = swapDraftEntries(activeGenerationId, lastEdit.entryIdA, lastEdit.entryIdB)
+      if (res.success) {
+        setEditHistory(rest)
+        setValidationResult(null)
+        setError(null)
+        setNotice(`Undid last swap. Re-run validation before publishing.`)
+        loadGenerationDetails(activeGenerationId)
+      } else {
+        setError(`Could not undo swap: ${res.error}`)
+      }
+    }
+  }, [activeGenerationId, editHistory, loadGenerationDetails])
 
   useEffect(() => {
     if (!currentAcademicYear) return
@@ -657,6 +803,20 @@ export function Generation() {
                       cells={gridCells}
                       renderEntry={renderDraftEntry}
                       entryCount={draftEntries.length}
+                      isEditable={isEditable}
+                      onMove={handleMove}
+                      onSwap={handleSwap}
+                      onUndo={handleUndo}
+                      canUndo={editHistory.length > 0}
+                      onOpenMoveDialog={(entry) => {
+                        setMoveTargetEntry(entry)
+                        setSelectedMoveDay(entry.dayOfWeek)
+                        setSelectedMoveSlotId(entry.timeSlotId)
+                        setSelectedSwapEntryId('')
+                        setMoveMode('move')
+                        setMoveError(null)
+                        setMoveDialogOpen(true)
+                      }}
                     />
                   )}
                 </div>
@@ -817,6 +977,170 @@ export function Generation() {
           </Button>
         </DialogFooter>
       </Dialog>
+
+      {/* Move / Swap Session Accessible Dialog */}
+      <Dialog
+        open={moveDialogOpen}
+        onOpenChange={(open) => {
+          setMoveDialogOpen(open)
+          if (!open) setMoveError(null)
+        }}
+        title="Move or Swap Draft Session"
+        description={
+          moveTargetEntry
+            ? `${moveTargetEntry.subject?.name} (${classTypeLabel(moveTargetEntry.classType)}) · ${moveTargetEntry.section?.name}`
+            : undefined
+        }
+      >
+        {moveTargetEntry && (
+          <div className="space-y-4 p-6">
+            <div className="p-3 bg-secondary-50 border border-secondary-200 rounded-lg text-xs text-secondary-600">
+              Current position: <strong className="text-secondary-900">{moveTargetEntry.dayOfWeek}</strong> at{' '}
+              <strong className="text-secondary-900">{moveTargetEntry.timeSlot?.name}</strong>{' '}
+              ({moveTargetEntry.span} period{moveTargetEntry.span > 1 ? 's' : ''})
+              {moveTargetEntry.span > 1 && (
+                <div className="text-primary-700 mt-1 font-medium">
+                  Note: Multi-period lab moves as one indivisible block across all {moveTargetEntry.span} periods.
+                </div>
+              )}
+            </div>
+
+            {moveError && (
+              <div className="p-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg">
+                {moveError}
+              </div>
+            )}
+
+            <div className="flex gap-2 border-b border-secondary-200 pb-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setMoveMode('move')
+                  setMoveError(null)
+                }}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                  moveMode === 'move' ? 'bg-primary-600 text-white' : 'bg-secondary-100 text-secondary-700 hover:bg-secondary-200'
+                )}
+              >
+                Move to New Period
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMoveMode('swap')
+                  setMoveError(null)
+                }}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                  moveMode === 'swap' ? 'bg-primary-600 text-white' : 'bg-secondary-100 text-secondary-700 hover:bg-secondary-200'
+                )}
+              >
+                Swap with Another Class
+              </button>
+            </div>
+
+            {moveMode === 'move' ? (
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-secondary-700 mb-1">Target Day</label>
+                  <select
+                    value={selectedMoveDay}
+                    onChange={(e) => setSelectedMoveDay(e.target.value as DayOfWeek)}
+                    className="w-full rounded-md border border-secondary-300 px-3 py-1.5 text-sm bg-white"
+                  >
+                    {workingDays.map((d) => (
+                      <option key={d} value={d}>
+                        {d.charAt(0) + d.slice(1).toLowerCase()}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-secondary-700 mb-1">Target Period</label>
+                  <select
+                    value={selectedMoveSlotId}
+                    onChange={(e) => setSelectedMoveSlotId(e.target.value)}
+                    className="w-full rounded-md border border-secondary-300 px-3 py-1.5 text-sm bg-white"
+                  >
+                    {orderedSlots
+                      .filter((s) => !s.isBreak)
+                      .map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name} ({s.startTime}–{s.endTime})
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-medium text-secondary-700 mb-1">
+                  Select Another Session to Swap With
+                </label>
+                <select
+                  value={selectedSwapEntryId}
+                  onChange={(e) => setSelectedSwapEntryId(e.target.value)}
+                  className="w-full rounded-md border border-secondary-300 px-3 py-1.5 text-sm bg-white"
+                >
+                  <option value="">Select a session...</option>
+                  {draftEntries
+                    .filter((e) => e.id !== moveTargetEntry.id)
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.dayOfWeek} {e.timeSlot?.name}: {e.subject?.name} ({e.section?.name})
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setMoveDialogOpen(false)
+                  setMoveError(null)
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  if (moveMode === 'move') {
+                    const slotToUse = selectedMoveSlotId || orderedSlots.find((s) => !s.isBreak)?.id || ''
+                    const res = moveDraftEntry(activeGenerationId!, moveTargetEntry.id, selectedMoveDay, slotToUse)
+                    if (!res.success) {
+                      setMoveError(res.error || 'Move could not be performed.')
+                    } else {
+                      setMoveDialogOpen(false)
+                      setMoveError(null)
+                      handleMove(moveTargetEntry.id, selectedMoveDay, slotToUse)
+                    }
+                  } else {
+                    if (!selectedSwapEntryId) {
+                      setMoveError('Please select a session to swap with.')
+                      return
+                    }
+                    const res = swapDraftEntries(activeGenerationId!, moveTargetEntry.id, selectedSwapEntryId)
+                    if (!res.success) {
+                      setMoveError(res.error || 'Swap could not be performed.')
+                    } else {
+                      setMoveDialogOpen(false)
+                      setMoveError(null)
+                      handleSwap(moveTargetEntry.id, selectedSwapEntryId)
+                    }
+                  }
+                }}
+              >
+                {moveMode === 'move' ? 'Apply Move' : 'Apply Swap'}
+              </Button>
+            </DialogFooter>
+          </div>
+        )}
+      </Dialog>
     </div>
   )
 }
@@ -867,7 +1191,13 @@ function StatTile({
  */
 export function renderDraftEntry(
   slotId: string,
-  item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+  item: { entry: DraftTimetableEntryWithRelations; isStart: boolean },
+  options?: {
+    isDraggable?: boolean
+    onMoveClick?: (entry: DraftTimetableEntryWithRelations) => void
+    onDragStart?: (entry: DraftTimetableEntryWithRelations) => void
+    onDragEnd?: () => void
+  }
 ): ReactNode {
   const { entry, isStart } = item
   if (!isStart) {
@@ -883,27 +1213,59 @@ export function renderDraftEntry(
   }
   const facultyNames = (entry.facultyList ?? []).map((f) => f.name)
   const roomNames = (entry.roomList ?? []).map((r) => r.name)
+  const isDraggable = Boolean(options?.isDraggable)
+
   return (
     <div
       key={entry.id}
+      draggable={isDraggable}
+      onDragStart={(e) => {
+        if (!isDraggable) return
+        e.dataTransfer.setData('text/plain', entry.id)
+        e.dataTransfer.effectAllowed = 'move'
+        options?.onDragStart?.(entry)
+      }}
+      onDragEnd={() => options?.onDragEnd?.()}
       className={cn(
-        'rounded-md border p-1.5 text-xs bg-white shadow-sm',
-        entry.classType === 'LAB' ? 'border-purple-300 bg-purple-50/40' : 'border-secondary-200'
+        'group rounded-md border p-1.5 text-xs bg-white shadow-sm transition-all',
+        entry.classType === 'LAB' ? 'border-purple-300 bg-purple-50/40' : 'border-secondary-200',
+        isDraggable && 'cursor-grab active:cursor-grabbing hover:shadow hover:border-primary-400'
       )}
     >
       <div className="flex items-start justify-between gap-1">
-        <span className="font-medium text-secondary-900 leading-tight">
-          {entry.subject?.name ?? entry.subjectId}
-          {entry.subject?.code ? <span className="text-secondary-400 ml-1">{entry.subject.code}</span> : null}
-        </span>
-        <span
-          className={cn(
-            'text-[10px] uppercase tracking-wide px-1 rounded',
-            entry.classType === 'LAB' ? 'bg-purple-100 text-purple-700' : 'bg-secondary-100 text-secondary-600'
+        <span className="font-medium text-secondary-900 leading-tight flex items-center gap-1">
+          {isDraggable && (
+            <GripVertical className="h-3 w-3 text-secondary-400 group-hover:text-secondary-600 flex-shrink-0" />
           )}
-        >
-          {classTypeLabel(entry.classType)}
+          <span>
+            {entry.subject?.name ?? entry.subjectId}
+            {entry.subject?.code ? <span className="text-secondary-400 ml-1">{entry.subject.code}</span> : null}
+          </span>
         </span>
+        <div className="flex items-center gap-1">
+          <span
+            className={cn(
+              'text-[10px] uppercase tracking-wide px-1 rounded',
+              entry.classType === 'LAB' ? 'bg-purple-100 text-purple-700' : 'bg-secondary-100 text-secondary-600'
+            )}
+          >
+            {classTypeLabel(entry.classType)}
+          </span>
+          {isDraggable && options?.onMoveClick && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                options.onMoveClick?.(entry)
+              }}
+              title="Move or swap this session"
+              aria-label="Move or swap this session"
+              className="p-0.5 text-secondary-400 hover:text-primary-700 hover:bg-secondary-100 rounded transition-colors"
+            >
+              <ArrowLeftRight className="h-3 w-3" />
+            </button>
+          )}
+        </div>
       </div>
       <div className="text-secondary-700 mt-1">
         {facultyNames.length > 0 ? facultyNames.join(', ') : <span className="text-secondary-400">No faculty</span>}
@@ -949,6 +1311,12 @@ export function DraftGrid({
   cells,
   renderEntry,
   entryCount,
+  isEditable = false,
+  onMove,
+  onSwap,
+  onUndo,
+  canUndo = false,
+  onOpenMoveDialog,
 }: {
   days: DayOfWeek[]
   slots: ReturnType<typeof timeSlotRepository.getOrdered>
@@ -956,45 +1324,104 @@ export function DraftGrid({
   cells: Map<string, { entry: DraftTimetableEntryWithRelations; isStart: boolean }[]>
   renderEntry: (
     slotId: string,
-    item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+    item: { entry: DraftTimetableEntryWithRelations; isStart: boolean },
+    options?: any
   ) => ReactNode
   entryCount: number
+  isEditable?: boolean
+  onMove?: (entryId: string, day: DayOfWeek, slotId: string) => void
+  onSwap?: (entryIdA: string, entryIdB: string) => void
+  onUndo?: () => void
+  canUndo?: boolean
+  onOpenMoveDialog?: (entry: DraftTimetableEntryWithRelations) => void
 }) {
+  const [draggedEntry, setDraggedEntry] = useState<DraftTimetableEntryWithRelations | null>(null)
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null)
+
+  const handleDropCell = (day: DayOfWeek, slotId: string, sectionId: string, targetEntryId?: string) => {
+    if (!draggedEntry) return
+    if (targetEntryId && targetEntryId !== draggedEntry.id) {
+      onSwap?.(draggedEntry.id, targetEntryId)
+    } else {
+      onMove?.(draggedEntry.id, day, slotId)
+    }
+  }
+
+  const customRender = (
+    slotId: string,
+    item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+  ) => {
+    return renderEntry(slotId, item, {
+      isDraggable: isEditable,
+      onDragStart: (entry: DraftTimetableEntryWithRelations) => setDraggedEntry(entry),
+      onDragEnd: () => {
+        setDraggedEntry(null)
+        setDragOverKey(null)
+      },
+      onMoveClick: (entry: DraftTimetableEntryWithRelations) => onOpenMoveDialog?.(entry),
+    })
+  }
+
   return (
-    <div className="overflow-x-auto" data-testid="draft-grid-scroll">
-      <table className="min-w-full border-collapse text-sm">
-        <thead>
-          <tr className="bg-secondary-50">
-            <th className="border border-secondary-200 p-2 text-left text-xs font-semibold text-secondary-600 sticky left-0 bg-secondary-50">
-              Period
-            </th>
-            {sections.map((section) => (
-              <th
-                key={section.id}
-                className="border border-secondary-200 p-2 text-left text-xs font-semibold text-secondary-700"
-              >
-                {section.name}
+    <div className="space-y-2">
+      {isEditable && (
+        <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-secondary-50 border border-secondary-200 rounded-lg text-xs">
+          <div className="flex items-center gap-2 text-secondary-700">
+            <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-primary-100 text-primary-700 font-bold text-[10px]">
+              i
+            </span>
+            <span>
+              <strong>Draft Grid Editing:</strong> Drag sessions to empty periods or drop onto another session to swap. Multi-period labs move as complete blocks. Edits automatically clear previous validation.
+            </span>
+          </div>
+          {canUndo && onUndo && (
+            <Button variant="outline" size="sm" onClick={onUndo} className="h-7 text-xs">
+              <Undo2 className="h-3.5 w-3.5 mr-1" />
+              Undo Last Edit
+            </Button>
+          )}
+        </div>
+      )}
+
+      <div className="overflow-x-auto" data-testid="draft-grid-scroll">
+        <table className="min-w-full border-collapse text-sm">
+          <thead>
+            <tr className="bg-secondary-50">
+              <th className="border border-secondary-200 p-2 text-left text-xs font-semibold text-secondary-600 sticky left-0 bg-secondary-50">
+                Period
               </th>
+              {sections.map((section) => (
+                <th
+                  key={section.id}
+                  className="border border-secondary-200 p-2 text-left text-xs font-semibold text-secondary-700"
+                >
+                  {section.name}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {days.map((day) => (
+              <DayRows
+                key={day}
+                day={day}
+                slots={slots}
+                sections={sections}
+                cells={cells}
+                renderEntry={customRender}
+                isEditable={isEditable}
+                onDropCell={handleDropCell}
+                dragOverKey={dragOverKey}
+                setDragOverKey={setDragOverKey}
+              />
             ))}
-          </tr>
-        </thead>
-        <tbody>
-          {days.map((day) => (
-            <DayRows
-              key={day}
-              day={day}
-              slots={slots}
-              sections={sections}
-              cells={cells}
-              renderEntry={renderEntry}
-            />
-          ))}
-        </tbody>
-      </table>
-      <p className="text-xs text-secondary-500 mt-2">
-        {entryCount} draft session(s). Multi-period activities (e.g. labs) are shown as one card
-        with continuation marks — they are never split across the break.
-      </p>
+          </tbody>
+        </table>
+        <p className="text-xs text-secondary-500 mt-2">
+          {entryCount} draft session(s). Multi-period activities (e.g. labs) are shown as one card
+          with continuation marks — they are never split across the break.
+        </p>
+      </div>
     </div>
   )
 }
@@ -1024,12 +1451,20 @@ export function DayRows({
   sections,
   cells,
   renderEntry,
+  isEditable = false,
+  onDropCell,
+  dragOverKey,
+  setDragOverKey,
 }: {
   day: DayOfWeek
   slots: ReturnType<typeof timeSlotRepository.getOrdered>
   sections: { id: string; name: string }[]
   cells: Map<string, { entry: DraftTimetableEntryWithRelations; isStart: boolean }[]>
   renderEntry: (slotId: string, item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }) => ReactNode
+  isEditable?: boolean
+  onDropCell?: (day: DayOfWeek, slotId: string, sectionId: string, targetEntryId?: string) => void
+  dragOverKey?: string | null
+  setDragOverKey?: (key: string | null) => void
 }) {
   const dayHasEntries = slots.some((slot) => cells.get(`${day}|${slot.id}`)?.length)
   return (
@@ -1059,9 +1494,37 @@ export function DayRows({
             </td>
           ) : (
             sections.map((section) => {
+              const cellKey = `${day}|${slot.id}|${section.id}`
+              const isOver = dragOverKey === cellKey
               const items = cells.get(`${day}|${slot.id}`)?.filter((item) => item.entry.sectionId === section.id) ?? []
               return (
-                <td key={section.id} className="border border-secondary-200 p-1.5 align-top min-w-[11rem]">
+                <td
+                  key={section.id}
+                  onDragOver={(e) => {
+                    if (isEditable) {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      setDragOverKey?.(cellKey)
+                    }
+                  }}
+                  onDragLeave={() => {
+                    if (isEditable && dragOverKey === cellKey) {
+                      setDragOverKey?.(null)
+                    }
+                  }}
+                  onDrop={(e) => {
+                    if (isEditable) {
+                      e.preventDefault()
+                      const targetEntryId = items[0]?.entry.id
+                      onDropCell?.(day, slot.id, section.id, targetEntryId)
+                      setDragOverKey?.(null)
+                    }
+                  }}
+                  className={cn(
+                    'border border-secondary-200 p-1.5 align-top min-w-[11rem] transition-colors',
+                    isOver && 'bg-primary-50 ring-2 ring-primary-500 ring-inset'
+                  )}
+                >
                   {items.length === 0 ? (
                     <span className="text-secondary-300 text-xs">—</span>
                   ) : (

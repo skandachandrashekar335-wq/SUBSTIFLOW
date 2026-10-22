@@ -2607,3 +2607,337 @@ export function deleteGeneration(generationId: string): boolean {
 }
 
 export type { GenerationStatus }
+
+export interface DraftEditResult {
+  success: boolean
+  error?: string
+}
+
+/**
+ * Move a draft entry to a new day and starting time slot.
+ * Atomically validates:
+ *  - Entry and generation exist, draft is not published
+ *  - Target day is a configured working day
+ *  - Target slot exists and span fits without exceeding day or crossing break
+ *  - Moving multi-period lab moves the entire continuous span
+ *  - Section is free across all covered slots
+ *  - All assigned faculty are free across all covered slots
+ *  - Any assigned room is free across all covered slots
+ */
+export function moveDraftEntry(
+  generationId: string,
+  entryId: string,
+  targetDay: DayOfWeek,
+  targetTimeSlotId: string
+): DraftEditResult {
+  const generation = timetableGenerationRepository.findById(generationId)
+  if (!generation) {
+    return { success: false, error: 'Generation does not exist.' }
+  }
+  if (draftTimetableEntryRepository.hasPublishedEntries(generationId)) {
+    return { success: false, error: 'Cannot modify a draft that has already been published.' }
+  }
+
+  const entries = draftTimetableEntryRepository.findByGenerationWithRelations(generationId)
+  const entry = entries.find((e) => e.id === entryId)
+  if (!entry) {
+    return { success: false, error: 'Draft entry not found.' }
+  }
+
+  if (entry.dayOfWeek === targetDay && entry.timeSlotId === targetTimeSlotId) {
+    return { success: true }
+  }
+
+  const data = loadAllData(generation.academicYearId)
+  if (!data.days.includes(targetDay)) {
+    return { success: false, error: `${targetDay} is not a configured working day.` }
+  }
+
+  const slotById = new Map(data.orderedSlots.map((s) => [s.id, s]))
+  const targetSlot = slotById.get(targetTimeSlotId)
+  if (!targetSlot) {
+    return { success: false, error: 'Target time period not found.' }
+  }
+
+  const span = Math.max(1, entry.span || 1)
+  const covered = resolveCoveredSlots(targetTimeSlotId, span)
+  if ('error' in covered) {
+    return { success: false, error: covered.error }
+  }
+
+  // Check break overlap
+  const hours = data.workingHours
+  const breakStart = timeToMinutes(hours.breakStart)
+  const breakEnd = timeToMinutes(hours.breakEnd)
+  for (const s of covered.slots) {
+    const overlapsBreak = timeToMinutes(s.startTime) < breakEnd && timeToMinutes(s.endTime) > breakStart
+    if (s.isBreak || overlapsBreak) {
+      return {
+        success: false,
+        error: `Cannot schedule session during or across the break (${hours.breakStart}–${hours.breakEnd}).`,
+      }
+    }
+  }
+
+  // Check working hours
+  const startLimit = timeToMinutes(hours.startTime)
+  const endLimit = timeToMinutes(hours.endTime)
+  const startMin = timeToMinutes(targetSlot.startTime)
+  const endSlot = covered.slots[covered.slots.length - 1]
+  const endMin = timeToMinutes(endSlot.endTime)
+  if (startMin < startLimit || endMin > endLimit) {
+    return {
+      success: false,
+      error: `Session would fall outside configured working hours (${hours.startTime}–${hours.endTime}).`,
+    }
+  }
+
+  // Check conflicts with other entries in this generation on targetDay
+  const targetSlotIds = new Set(covered.slots.map((s) => s.id))
+  const otherEntries = entries.filter((e) => e.id !== entryId && e.dayOfWeek === targetDay)
+  const entryFacultyIds = new Set((entry.facultyList ?? []).map((f) => f.id))
+  const entryRoomIds = new Set((entry.roomList ?? []).map((r) => r.id))
+
+  for (const other of otherEntries) {
+    const otherCovered = resolveCoveredSlots(other.timeSlotId, other.span)
+    if ('error' in otherCovered) continue
+    const overlaps = otherCovered.slots.some((s) => targetSlotIds.has(s.id))
+    if (!overlaps) continue
+
+    if (other.sectionId === entry.sectionId) {
+      const secName = other.section?.name ?? 'This section'
+      const subName = other.subject?.name ?? 'another class'
+      return {
+        success: false,
+        error: `Section conflict: ${secName} already has ${subName} scheduled during this period.`,
+      }
+    }
+
+    for (const fac of other.facultyList ?? []) {
+      if (entryFacultyIds.has(fac.id)) {
+        return {
+          success: false,
+          error: `Faculty conflict: ${fac.name} is already teaching ${other.subject?.name ?? 'a class'} (${other.section?.name ?? ''}) during this period.`,
+        }
+      }
+    }
+
+    for (const room of other.roomList ?? []) {
+      if (entryRoomIds.has(room.id)) {
+        return {
+          success: false,
+          error: `Room conflict: ${room.name} is already booked by ${other.section?.name ?? 'another section'} during this period.`,
+        }
+      }
+    }
+  }
+
+  // Valid! Execute in transaction
+  withTransaction(() => {
+    getDatabase()
+      .prepare(
+        'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      )
+      .run(targetDay, targetTimeSlotId, entryId)
+  })
+
+  return { success: true }
+}
+
+/**
+ * Swap two draft entries. Both entries swap their day and start time slot.
+ * Atomically validates:
+ *  - Both entries exist, belong to this generation, draft not published
+ *  - Entry A fits into B's time slot/day across its full span
+ *  - Entry B fits into A's time slot/day across its full span
+ *  - Neither crosses the break or exceeds day boundaries
+ *  - Section, faculty, and room availability for both new positions
+ */
+export function swapDraftEntries(
+  generationId: string,
+  entryIdA: string,
+  entryIdB: string
+): DraftEditResult {
+  if (entryIdA === entryIdB) {
+    return { success: true }
+  }
+
+  const generation = timetableGenerationRepository.findById(generationId)
+  if (!generation) {
+    return { success: false, error: 'Generation does not exist.' }
+  }
+  if (draftTimetableEntryRepository.hasPublishedEntries(generationId)) {
+    return { success: false, error: 'Cannot modify a draft that has already been published.' }
+  }
+
+  const entries = draftTimetableEntryRepository.findByGenerationWithRelations(generationId)
+  const entryA = entries.find((e) => e.id === entryIdA)
+  const entryB = entries.find((e) => e.id === entryIdB)
+  if (!entryA || !entryB) {
+    return { success: false, error: 'One or both draft entries were not found.' }
+  }
+
+  const data = loadAllData(generation.academicYearId)
+  const hours = data.workingHours
+  const breakStart = timeToMinutes(hours.breakStart)
+  const breakEnd = timeToMinutes(hours.breakEnd)
+  const startLimit = timeToMinutes(hours.startTime)
+  const endLimit = timeToMinutes(hours.endTime)
+
+  // Target for A is B's slot and day
+  const targetDayA = entryB.dayOfWeek
+  const targetSlotIdA = entryB.timeSlotId
+  const coveredA = resolveCoveredSlots(targetSlotIdA, entryA.span)
+  if ('error' in coveredA) {
+    return {
+      success: false,
+      error: `Cannot place ${entryA.subject?.name ?? 'activity A'} at target time: ${coveredA.error}`,
+    }
+  }
+
+  for (const s of coveredA.slots) {
+    const overlapsBreak = timeToMinutes(s.startTime) < breakEnd && timeToMinutes(s.endTime) > breakStart
+    if (s.isBreak || overlapsBreak) {
+      return { success: false, error: `Swapping would place ${entryA.subject?.name ?? 'activity'} across the break.` }
+    }
+  }
+  const startMinA = timeToMinutes(coveredA.slots[0].startTime)
+  const endMinA = timeToMinutes(coveredA.slots[coveredA.slots.length - 1].endTime)
+  if (startMinA < startLimit || endMinA > endLimit) {
+    return { success: false, error: `Swapping would place ${entryA.subject?.name ?? 'activity'} outside working hours.` }
+  }
+
+  // Target for B is A's slot and day
+  const targetDayB = entryA.dayOfWeek
+  const targetSlotIdB = entryA.timeSlotId
+  const coveredB = resolveCoveredSlots(targetSlotIdB, entryB.span)
+  if ('error' in coveredB) {
+    return {
+      success: false,
+      error: `Cannot place ${entryB.subject?.name ?? 'activity B'} at target time: ${coveredB.error}`,
+    }
+  }
+
+  for (const s of coveredB.slots) {
+    const overlapsBreak = timeToMinutes(s.startTime) < breakEnd && timeToMinutes(s.endTime) > breakStart
+    if (s.isBreak || overlapsBreak) {
+      return { success: false, error: `Swapping would place ${entryB.subject?.name ?? 'activity'} across the break.` }
+    }
+  }
+  const startMinB = timeToMinutes(coveredB.slots[0].startTime)
+  const endMinB = timeToMinutes(coveredB.slots[coveredB.slots.length - 1].endTime)
+  if (startMinB < startLimit || endMinB > endLimit) {
+    return { success: false, error: `Swapping would place ${entryB.subject?.name ?? 'activity'} outside working hours.` }
+  }
+
+  // Other entries (excluding both A and B)
+  const otherEntries = entries.filter((e) => e.id !== entryIdA && e.id !== entryIdB)
+  const slotIdsA = new Set(coveredA.slots.map((s) => s.id))
+  const slotIdsB = new Set(coveredB.slots.map((s) => s.id))
+
+  const facultyIdsA = new Set((entryA.facultyList ?? []).map((f) => f.id))
+  const roomIdsA = new Set((entryA.roomList ?? []).map((r) => r.id))
+  const facultyIdsB = new Set((entryB.facultyList ?? []).map((f) => f.id))
+  const roomIdsB = new Set((entryB.roomList ?? []).map((r) => r.id))
+
+  // 1. Check A in its new slot against other entries
+  for (const other of otherEntries.filter((e) => e.dayOfWeek === targetDayA)) {
+    const otherCovered = resolveCoveredSlots(other.timeSlotId, other.span)
+    if ('error' in otherCovered) continue
+    if (!otherCovered.slots.some((s) => slotIdsA.has(s.id))) continue
+
+    if (other.sectionId === entryA.sectionId) {
+      return {
+        success: false,
+        error: `Section conflict: ${entryA.section?.name ?? ''} already has ${other.subject?.name ?? 'a class'} during ${targetDayA} period.`,
+      }
+    }
+    for (const fac of other.facultyList ?? []) {
+      if (facultyIdsA.has(fac.id)) {
+        return {
+          success: false,
+          error: `Faculty conflict: ${fac.name} is already scheduled during ${targetDayA} period.`,
+        }
+      }
+    }
+    for (const room of other.roomList ?? []) {
+      if (roomIdsA.has(room.id)) {
+        return {
+          success: false,
+          error: `Room conflict: ${room.name} is already booked during ${targetDayA} period.`,
+        }
+      }
+    }
+  }
+
+  // 2. Check B in its new slot against other entries
+  for (const other of otherEntries.filter((e) => e.dayOfWeek === targetDayB)) {
+    const otherCovered = resolveCoveredSlots(other.timeSlotId, other.span)
+    if ('error' in otherCovered) continue
+    if (!otherCovered.slots.some((s) => slotIdsB.has(s.id))) continue
+
+    if (other.sectionId === entryB.sectionId) {
+      return {
+        success: false,
+        error: `Section conflict: ${entryB.section?.name ?? ''} already has ${other.subject?.name ?? 'a class'} during ${targetDayB} period.`,
+      }
+    }
+    for (const fac of other.facultyList ?? []) {
+      if (facultyIdsB.has(fac.id)) {
+        return {
+          success: false,
+          error: `Faculty conflict: ${fac.name} is already scheduled during ${targetDayB} period.`,
+        }
+      }
+    }
+    for (const room of other.roomList ?? []) {
+      if (roomIdsB.has(room.id)) {
+        return {
+          success: false,
+          error: `Room conflict: ${room.name} is already booked during ${targetDayB} period.`,
+        }
+      }
+    }
+  }
+
+  // 3. Mutual conflicts between A and B if new slots overlap
+  if (targetDayA === targetDayB) {
+    const mutualOverlap = coveredA.slots.some((s) => slotIdsB.has(s.id))
+    if (mutualOverlap) {
+      if (entryA.sectionId === entryB.sectionId) {
+        return { success: false, error: 'Cannot swap: activities would overlap for the same section.' }
+      }
+      for (const fid of facultyIdsA) {
+        if (facultyIdsB.has(fid)) {
+          return { success: false, error: 'Cannot swap: shared faculty would have overlapping periods.' }
+        }
+      }
+      for (const rid of roomIdsA) {
+        if (roomIdsB.has(rid)) {
+          return { success: false, error: 'Cannot swap: shared room would have overlapping periods.' }
+        }
+      }
+    }
+  }
+
+  // Valid! Execute in transaction using temporary state to satisfy UNIQUE constraints
+  withTransaction(() => {
+    const db = getDatabase()
+    // Step 1: Park entry A at a temporary day to avoid immediate UNIQUE conflict if A and B share a section
+    db.prepare('UPDATE draft_timetable_entries SET day_of_week = ? WHERE id = ?').run(
+      '__TEMP_SWAPPING__',
+      entryIdA
+    )
+    // Step 2: Move entry B into A's position
+    db.prepare(
+      'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+    ).run(targetDayB, targetSlotIdB, entryIdB)
+    // Step 3: Move entry A into B's position
+    db.prepare(
+      'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+    ).run(targetDayA, targetSlotIdA, entryIdA)
+  })
+
+  return { success: true }
+}
+
