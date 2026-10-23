@@ -120,6 +120,43 @@ describe('calculateSectionCapacities (section-wise timetable capacity)', () => {
     expect(sec.remainingPeriods).toBe(33)
   })
 
+  it('allocations take precedence over requirements when allocations array is provided', () => {
+    const requirements = [
+      { sectionId: 'sec-i-a', subjectId: 'sub-dms', classType: 'LECTURE', requiredSessionsPerWeek: 4, span: 1 },
+    ]
+
+    // 0 allocations provided even though requirement exists
+    const emptyResult = calculateSectionCapacities({
+      sections: [sections[0]],
+      requirements,
+      allocations: [],
+    })
+    expect(emptyResult.sections[0].allocatedSessions).toBe(0)
+    expect(emptyResult.sections[0].allocatedPeriods).toBe(0)
+    expect(emptyResult.sections[0].remainingPeriods).toBe(36)
+
+    // 2 sessions allocated so far
+    const partialResult = calculateSectionCapacities({
+      sections: [sections[0]],
+      requirements,
+      allocations: [
+        { sectionId: 'sec-i-a', subjectId: 'sub-dms', classType: 'LECTURE', facultyId: 'f1', requiredSessionsPerWeek: 2 },
+      ],
+    })
+    expect(partialResult.sections[0].allocatedSessions).toBe(2)
+    expect(partialResult.sections[0].allocatedPeriods).toBe(2)
+    expect(partialResult.sections[0].remainingPeriods).toBe(34)
+
+    // When allocations parameter is undefined, requirements are used as the demand baseline
+    const fallbackResult = calculateSectionCapacities({
+      sections: [sections[0]],
+      requirements,
+    })
+    expect(fallbackResult.sections[0].allocatedSessions).toBe(4)
+    expect(fallbackResult.sections[0].allocatedPeriods).toBe(4)
+    expect(fallbackResult.sections[0].remainingPeriods).toBe(32)
+  })
+
   it('calculates realistic demo fixture numbers (124 sessions, 140 periods, 76 remaining out of 216)', () => {
     // Sem 1 (A & B): 20 sessions, 23 periods each
     // Sem 3 (A & B): 21 sessions, 24 periods each

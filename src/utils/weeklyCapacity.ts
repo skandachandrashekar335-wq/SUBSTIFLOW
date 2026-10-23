@@ -127,19 +127,11 @@ export function calculateSectionCapacities(params: {
     let allocatedSessions = 0
     let allocatedPeriods = 0
 
+    const secAllocs = (params.allocations !== undefined ? allocations : []).filter((a) => a.sectionId === sec.id)
     const secReqs = requirements.filter((r) => r.sectionId === sec.id)
 
-    if (secReqs.length > 0) {
-      // Requirements are authoritative for section demand and span
-      for (const req of secReqs) {
-        const sessions = Number(req.requiredSessionsPerWeek) || 0
-        const span = Math.max(1, Number(req.span) || (req.classType === 'LAB' ? 2 : 1))
-        allocatedSessions += sessions
-        allocatedPeriods += sessions * span
-      }
-    } else {
-      // Fallback: derive from allocations grouped by activity
-      const secAllocs = allocations.filter((a) => a.sectionId === sec.id)
+    if (params.allocations !== undefined) {
+      // Derive from allocations grouped by activity
       const activityMap = new Map<string, AllocationSpecInput[]>()
       for (const a of secAllocs) {
         const key = `${a.subjectId}|${a.classType}`
@@ -152,10 +144,10 @@ export function calculateSectionCapacities(params: {
         const first = allocList[0]
         const req = reqMap.get(`${sec.id}|${first.subjectId}|${first.classType}`)
         const span = req?.span ?? (first.classType === 'LAB' ? 2 : 1)
-        const arrangement = req?.teachingArrangement ?? (allocList.length > 1 ? 'TEAM' : 'AUTO')
+        const isTeam = req?.teachingArrangement === 'TEAM'
 
         let sessions = 0
-        if (arrangement === 'TEAM') {
+        if (isTeam) {
           // In team teaching, all faculty teach the same session simultaneously
           sessions = Number(first.requiredSessionsPerWeek) || 1
         } else {
@@ -163,6 +155,14 @@ export function calculateSectionCapacities(params: {
           sessions = allocList.reduce((s, a) => s + (Number(a.requiredSessionsPerWeek) || 0), 0)
         }
 
+        allocatedSessions += sessions
+        allocatedPeriods += sessions * span
+      }
+    } else if (secReqs.length > 0) {
+      // Requirements are authoritative for section demand and span when allocations are not specified
+      for (const req of secReqs) {
+        const sessions = Number(req.requiredSessionsPerWeek) || 0
+        const span = Math.max(1, Number(req.span) || (req.classType === 'LAB' ? 2 : 1))
         allocatedSessions += sessions
         allocatedPeriods += sessions * span
       }
