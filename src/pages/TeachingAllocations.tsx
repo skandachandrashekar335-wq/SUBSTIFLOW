@@ -11,7 +11,7 @@ import {
   getAllocationsGroupedBySectionSubject,
 } from '@/services/timetableGeneration'
 import { ClassType } from '@/types'
-import { calculateSectionCapacities } from '@/utils/weeklyCapacity'
+import { calculateSectionCapacities, weeklySessionCounter, WEEKLY_SESSION_CAPACITY } from '@/utils/weeklyCapacity'
 import { Button } from '@/components/ui/Button'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
 import { Dialog } from '@/components/ui/Dialog'
@@ -90,6 +90,21 @@ export function TeachingAllocations() {
     if (!selectedSectionId) return null
     return capacitySummary.sections.find((s) => s.sectionId === selectedSectionId) ?? null
   }, [capacitySummary, selectedSectionId])
+
+  // Active weekly session counter:
+  // If a single section is selected (or only 1 section exists in the academic year),
+  // compute capacity for that section (36).
+  // If multiple sections exist and "All Sections" is selected, compare total against
+  // aggregate capacity (sections.length * 36).
+  const activeSessionCounter = useMemo(() => {
+    const targetSectionId = selectedSectionId || (sections.length === 1 ? sections[0].id : null)
+    if (targetSectionId) {
+      const secAllocs = allocations.filter((a) => a.sectionId === targetSectionId)
+      return weeklySessionCounter(secAllocs, WEEKLY_SESSION_CAPACITY)
+    }
+    const totalCapacity = sections.length > 0 ? sections.length * WEEKLY_SESSION_CAPACITY : WEEKLY_SESSION_CAPACITY
+    return weeklySessionCounter(allocations, totalCapacity)
+  }, [allocations, selectedSectionId, sections])
 
   // Filtered grouped allocations
   const displayedGroups = useMemo(() => {
@@ -349,36 +364,28 @@ export function TeachingAllocations() {
 
               {/* Weekly counter in header with data-testid for compatibility */}
               <div className="flex items-baseline gap-x-2 text-sm" data-testid="weekly-session-counter">
-                {activeSectionCapacity ? (
-                  <>
-                    <span className={activeSectionCapacity.isOverCapacity ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
-                      {activeSectionCapacity.allocatedPeriods} / {activeSectionCapacity.weeklyCapacity}
-                    </span>
-                    <span className="text-secondary-500">periods/week</span>
-                    {activeSectionCapacity.isOverCapacity ? (
-                      <span className="font-medium text-danger-600">capacity exceeded (+{activeSectionCapacity.exceededBy})</span>
-                    ) : (
-                      <>
-                        <span className="text-secondary-300" aria-hidden="true">·</span>
-                        <span className="text-secondary-500">{activeSectionCapacity.remainingPeriods} remaining ({activeSectionCapacity.allocatedSessions} sessions)</span>
-                      </>
-                    )}
-                  </>
+                <span className={activeSessionCounter.exceededBy !== null ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
+                  {activeSessionCounter.allocated} / {activeSessionCounter.capacity}
+                </span>
+                <span className="text-secondary-500">sessions/week</span>
+                {activeSessionCounter.exceededBy !== null ? (
+                  <span className="font-medium text-danger-600">
+                    capacity exceeded (+{activeSessionCounter.exceededBy})
+                  </span>
                 ) : (
                   <>
-                    <span className={capacitySummary.isOverCapacity ? 'font-semibold text-danger-600' : 'font-semibold text-secondary-900'}>
-                      {capacitySummary.totalAllocatedPeriods} / {capacitySummary.totalCapacity}
-                    </span>
-                    <span className="text-secondary-500">periods/week</span>
-                    {capacitySummary.isOverCapacity ? (
-                      <span className="font-medium text-danger-600">capacity exceeded (+{capacitySummary.exceededBy})</span>
-                    ) : (
-                      <>
-                        <span className="text-secondary-300" aria-hidden="true">·</span>
-                        <span className="text-secondary-500">{capacitySummary.remainingPeriods} remaining ({capacitySummary.totalAllocatedSessions} sessions)</span>
-                      </>
-                    )}
+                    <span className="text-secondary-300" aria-hidden="true">·</span>
+                    <span className="text-secondary-500">{activeSessionCounter.remaining} remaining</span>
                   </>
+                )}
+                {activeSectionCapacity ? (
+                  <span className="text-xs text-secondary-400 font-normal">
+                    ({activeSectionCapacity.allocatedPeriods} periods occupied)
+                  </span>
+                ) : (
+                  <span className="text-xs text-secondary-400 font-normal">
+                    ({capacitySummary.totalAllocatedPeriods} periods occupied)
+                  </span>
                 )}
               </div>
             </div>
