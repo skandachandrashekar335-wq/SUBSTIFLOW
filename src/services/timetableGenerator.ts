@@ -2733,13 +2733,20 @@ export function moveDraftEntry(
   }
 
   // Valid! Execute in transaction
-  withTransaction(() => {
-    getDatabase()
-      .prepare(
-        'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
-      )
-      .run(targetDay, targetTimeSlotId, entryId)
-  })
+  try {
+    withTransaction(() => {
+      getDatabase()
+        .prepare(
+          'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+        )
+        .run(targetDay, targetTimeSlotId, entryId)
+    })
+  } catch (err) {
+    return {
+      success: false,
+      error: `Failed to move draft session: ${err instanceof Error ? err.message : String(err)}`,
+    }
+  }
 
   return { success: true }
 }
@@ -2921,22 +2928,29 @@ export function swapDraftEntries(
   }
 
   // Valid! Execute in transaction using temporary state to satisfy UNIQUE constraints
-  withTransaction(() => {
-    const db = getDatabase()
-    // Step 1: Park entry A at a temporary day to avoid immediate UNIQUE conflict if A and B share a section
-    db.prepare('UPDATE draft_timetable_entries SET day_of_week = ? WHERE id = ?').run(
-      '__TEMP_SWAPPING__',
-      entryIdA
-    )
-    // Step 2: Move entry B into A's position
-    db.prepare(
-      'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
-    ).run(targetDayB, targetSlotIdB, entryIdB)
-    // Step 3: Move entry A into B's position
-    db.prepare(
-      'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
-    ).run(targetDayA, targetSlotIdA, entryIdA)
-  })
+  try {
+    withTransaction(() => {
+      const db = getDatabase()
+      // Step 1: Park entry A at a temporary day to avoid immediate UNIQUE conflict if A and B share a section
+      db.prepare('UPDATE draft_timetable_entries SET day_of_week = ? WHERE id = ?').run(
+        '__TEMP_SWAPPING__',
+        entryIdA
+      )
+      // Step 2: Move entry B into A's position
+      db.prepare(
+        'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      ).run(targetDayB, targetSlotIdB, entryIdB)
+      // Step 3: Move entry A into B's position
+      db.prepare(
+        'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      ).run(targetDayA, targetSlotIdA, entryIdA)
+    })
+  } catch (err) {
+    return {
+      success: false,
+      error: `Failed to swap draft sessions: ${err instanceof Error ? err.message : String(err)}`,
+    }
+  }
 
   return { success: true }
 }

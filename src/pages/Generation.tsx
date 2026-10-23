@@ -121,28 +121,38 @@ export function Generation() {
     return gens
   }, [currentAcademicYear])
 
-  const loadGenerationDetails = useCallback((generationId: string) => {
+  const refreshDraftData = useCallback((generationId: string) => {
     setDraftEntries(draftTimetableEntryRepository.findByGenerationWithRelations(generationId))
     setDiagnostics(generationDiagnosticRepository.findByGeneration(generationId))
     setStatusInfo(getGenerationStatus(generationId))
-    // Independent validation pass — recomputed from scratch on every view.
-    setValidationResult(validateDraftTimetable(generationId))
   }, [])
 
+  const loadGenerationDetails = useCallback(
+    (generationId: string, runValidation = true) => {
+      refreshDraftData(generationId)
+      if (runValidation) {
+        // Independent validation pass — recomputed from scratch on every view.
+        setValidationResult(validateDraftTimetable(generationId))
+      }
+    },
+    [refreshDraftData]
+  )
+
   const handleMove = useCallback(
-    (entryId: string, targetDay: DayOfWeek, targetSlotId: string) => {
-      if (!activeGenerationId) return
+    (entryId: string, targetDay: DayOfWeek, targetSlotId: string): { success: boolean; error?: string } => {
+      if (!activeGenerationId) return { success: false, error: 'No active generation.' }
       const entry = draftEntries.find((e) => e.id === entryId)
-      if (!entry) return
-      if (entry.dayOfWeek === targetDay && entry.timeSlotId === targetSlotId) return
+      if (!entry) return { success: false, error: 'Draft session not found.' }
+      if (entry.dayOfWeek === targetDay && entry.timeSlotId === targetSlotId) return { success: true }
 
       const prevDay = entry.dayOfWeek
       const prevSlotId = entry.timeSlotId
 
       const res = moveDraftEntry(activeGenerationId, entryId, targetDay, targetSlotId)
       if (!res.success) {
-        setError(res.error || 'Could not move session.')
-        return
+        const errorMsg = res.error || 'Could not move session.'
+        setError(errorMsg)
+        return { success: false, error: errorMsg }
       }
 
       setEditHistory((prev) => [
@@ -156,24 +166,25 @@ export function Generation() {
         ...prev.slice(0, 19),
       ])
 
-      // Invalidate previous validation status
+      // Invalidate previous validation status — draft has unvalidated changes
       setValidationResult(null)
       setError(null)
       setNotice(
         `Moved ${entry.subject?.name ?? 'session'} to ${targetDay}. Previous validation cleared — re-run validation before publishing.`
       )
-      loadGenerationDetails(activeGenerationId)
+      refreshDraftData(activeGenerationId)
+      return { success: true }
     },
-    [activeGenerationId, draftEntries, loadGenerationDetails]
+    [activeGenerationId, draftEntries, refreshDraftData]
   )
 
   const handleSwap = useCallback(
-    (entryIdA: string, entryIdB: string) => {
-      if (!activeGenerationId) return
-      if (entryIdA === entryIdB) return
+    (entryIdA: string, entryIdB: string): { success: boolean; error?: string } => {
+      if (!activeGenerationId) return { success: false, error: 'No active generation.' }
+      if (entryIdA === entryIdB) return { success: true }
       const entryA = draftEntries.find((e) => e.id === entryIdA)
       const entryB = draftEntries.find((e) => e.id === entryIdB)
-      if (!entryA || !entryB) return
+      if (!entryA || !entryB) return { success: false, error: 'One or both sessions were not found.' }
 
       const prevDayA = entryA.dayOfWeek
       const prevSlotA = entryA.timeSlotId
@@ -182,8 +193,9 @@ export function Generation() {
 
       const res = swapDraftEntries(activeGenerationId, entryIdA, entryIdB)
       if (!res.success) {
-        setError(res.error || 'Could not swap sessions.')
-        return
+        const errorMsg = res.error || 'Could not swap sessions.'
+        setError(errorMsg)
+        return { success: false, error: errorMsg }
       }
 
       setEditHistory((prev) => [
@@ -200,15 +212,16 @@ export function Generation() {
         ...prev.slice(0, 19),
       ])
 
-      // Invalidate previous validation status
+      // Invalidate previous validation status — draft has unvalidated changes
       setValidationResult(null)
       setError(null)
       setNotice(
         `Swapped ${entryA.subject?.name ?? 'class'} and ${entryB.subject?.name ?? 'class'}. Previous validation cleared — re-run validation before publishing.`
       )
-      loadGenerationDetails(activeGenerationId)
+      refreshDraftData(activeGenerationId)
+      return { success: true }
     },
-    [activeGenerationId, draftEntries, loadGenerationDetails]
+    [activeGenerationId, draftEntries, refreshDraftData]
   )
 
   const handleUndo = useCallback(() => {
@@ -222,7 +235,7 @@ export function Generation() {
         setValidationResult(null)
         setError(null)
         setNotice(`Undid last move: restored session to ${lastEdit.dayA}. Re-run validation before publishing.`)
-        loadGenerationDetails(activeGenerationId)
+        refreshDraftData(activeGenerationId)
       } else {
         setError(`Could not undo move: ${res.error}`)
       }
@@ -233,12 +246,12 @@ export function Generation() {
         setValidationResult(null)
         setError(null)
         setNotice(`Undid last swap. Re-run validation before publishing.`)
-        loadGenerationDetails(activeGenerationId)
+        refreshDraftData(activeGenerationId)
       } else {
         setError(`Could not undo swap: ${res.error}`)
       }
     }
-  }, [activeGenerationId, editHistory, loadGenerationDetails])
+  }, [activeGenerationId, editHistory, refreshDraftData])
 
   useEffect(() => {
     if (!currentAcademicYear) return
@@ -449,7 +462,8 @@ export function Generation() {
   const canPublish =
     activeGeneration?.status === 'COMPLETED' &&
     !statusInfo?.published &&
-    (validationResult === null || validationResult.valid)
+    validationResult !== null &&
+    validationResult.valid
 
   const renderDiagnosticsList = (list: GenerationDiagnostic[]) => (
     <div className="space-y-3">
@@ -702,7 +716,9 @@ export function Generation() {
                       ? 'This draft has already been published.'
                       : activeGeneration.status !== 'COMPLETED'
                         ? 'Only a successfully completed run can be published.'
-                        : 'Fix the validation problems first.'
+                        : validationResult === null
+                          ? 'Validate the draft first before publishing.'
+                          : 'Fix the validation problems first.'
                     : 'Publish this draft as the master timetable'
                 }
               >
@@ -808,6 +824,10 @@ export function Generation() {
                       onSwap={handleSwap}
                       onUndo={handleUndo}
                       canUndo={editHistory.length > 0}
+                      onDropError={(err) => {
+                        setError(err)
+                        setNotice(null)
+                      }}
                       onOpenMoveDialog={(entry) => {
                         setMoveTargetEntry(entry)
                         setSelectedMoveDay(entry.dayOfWeek)
@@ -866,9 +886,19 @@ export function Generation() {
                     </div>
                     <Button variant="outline" size="sm" onClick={handleValidate}>
                       <RefreshCw className="h-4 w-4 mr-1" />
-                      Re-run validation
+                      {validationResult === null ? 'Run validation' : 'Re-run validation'}
                     </Button>
                   </div>
+
+                  {!validationResult && (
+                    <div className="p-6 text-center text-secondary-500 bg-secondary-50 border border-secondary-200 rounded-lg">
+                      <AlertTriangle className="h-8 w-8 text-amber-500 mx-auto mb-2" />
+                      <p className="font-medium text-secondary-800">Draft has unvalidated changes</p>
+                      <p className="text-xs text-secondary-500 mt-1">
+                        Edits have been made to this draft since the last validation run. Re-run validation to verify all hard constraints before publishing.
+                      </p>
+                    </div>
+                  )}
 
                   {validationResult && (
                     <>
@@ -1111,26 +1141,24 @@ export function Generation() {
                 onClick={() => {
                   if (moveMode === 'move') {
                     const slotToUse = selectedMoveSlotId || orderedSlots.find((s) => !s.isBreak)?.id || ''
-                    const res = moveDraftEntry(activeGenerationId!, moveTargetEntry.id, selectedMoveDay, slotToUse)
+                    const res = handleMove(moveTargetEntry.id, selectedMoveDay, slotToUse)
                     if (!res.success) {
                       setMoveError(res.error || 'Move could not be performed.')
                     } else {
                       setMoveDialogOpen(false)
                       setMoveError(null)
-                      handleMove(moveTargetEntry.id, selectedMoveDay, slotToUse)
                     }
                   } else {
                     if (!selectedSwapEntryId) {
                       setMoveError('Please select a session to swap with.')
                       return
                     }
-                    const res = swapDraftEntries(activeGenerationId!, moveTargetEntry.id, selectedSwapEntryId)
+                    const res = handleSwap(moveTargetEntry.id, selectedSwapEntryId)
                     if (!res.success) {
                       setMoveError(res.error || 'Swap could not be performed.')
                     } else {
                       setMoveDialogOpen(false)
                       setMoveError(null)
-                      handleSwap(moveTargetEntry.id, selectedSwapEntryId)
                     }
                   }
                 }}
@@ -1254,6 +1282,8 @@ export function renderDraftEntry(
           {isDraggable && options?.onMoveClick && (
             <button
               type="button"
+              draggable={false}
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation()
                 options.onMoveClick?.(entry)
@@ -1299,6 +1329,71 @@ export function renderDraftEntry(
   )
 }
 
+export interface DraftDropEvent {
+  draggedEntry: DraftTimetableEntryWithRelations
+  targetDay: DayOfWeek
+  targetSlotId: string
+  targetSectionId: string
+  targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+}
+
+export interface DraftDropResult {
+  action: 'move' | 'swap' | 'none'
+  success: boolean
+  error?: string
+}
+
+export function evaluateDraftDrop(event: DraftDropEvent): DraftDropResult {
+  const { draggedEntry, targetDay, targetSlotId, targetSectionId, targetItem } = event
+
+  // Dropping onto itself is a no-op
+  if (targetItem && targetItem.entry.id === draggedEntry.id) {
+    return { action: 'none', success: true }
+  }
+
+  // Dropping onto same slot in same section with no other item is a no-op
+  if (
+    !targetItem &&
+    draggedEntry.dayOfWeek === targetDay &&
+    draggedEntry.timeSlotId === targetSlotId &&
+    draggedEntry.sectionId === targetSectionId
+  ) {
+    return { action: 'none', success: true }
+  }
+
+  // Dropping onto a lab's continuation period is rejected
+  if (targetItem && !targetItem.isStart) {
+    return {
+      action: 'none',
+      success: false,
+      error: 'Cannot drop onto a lab continuation period. Multi-period activities move and swap as complete blocks from their starting period.',
+    }
+  }
+
+  // Dropping onto another entry's start cell triggers a swap
+  if (targetItem && targetItem.isStart) {
+    return {
+      action: 'swap',
+      success: true,
+    }
+  }
+
+  // Dropping onto an empty cell in another section is rejected
+  if (draggedEntry.sectionId !== targetSectionId) {
+    return {
+      action: 'none',
+      success: false,
+      error: 'Cannot move session to another section. Dragging across sections would change academic ownership.',
+    }
+  }
+
+  // Dropping onto an empty cell in the same section triggers a move
+  return {
+    action: 'move',
+    success: true,
+  }
+}
+
 /**
  * One horizontal scroll container holds the header AND every day's rows, so
  * all configured section columns stay aligned with their headers and remain
@@ -1317,6 +1412,7 @@ export function DraftGrid({
   onUndo,
   canUndo = false,
   onOpenMoveDialog,
+  onDropError,
 }: {
   days: DayOfWeek[]
   slots: ReturnType<typeof timeSlotRepository.getOrdered>
@@ -1334,16 +1430,42 @@ export function DraftGrid({
   onUndo?: () => void
   canUndo?: boolean
   onOpenMoveDialog?: (entry: DraftTimetableEntryWithRelations) => void
+  onDropError?: (error: string) => void
 }) {
   const [draggedEntry, setDraggedEntry] = useState<DraftTimetableEntryWithRelations | null>(null)
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
 
-  const handleDropCell = (day: DayOfWeek, slotId: string, sectionId: string, targetEntryId?: string) => {
+  const handleDropCell = (
+    day: DayOfWeek,
+    slotId: string,
+    sectionId: string,
+    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+  ) => {
     if (!draggedEntry) return
-    if (targetEntryId && targetEntryId !== draggedEntry.id) {
-      onSwap?.(draggedEntry.id, targetEntryId)
-    } else {
-      onMove?.(draggedEntry.id, day, slotId)
+    const evaluation = evaluateDraftDrop({
+      draggedEntry,
+      targetDay: day,
+      targetSlotId: slotId,
+      targetSectionId: sectionId,
+      targetItem,
+    })
+
+    const currentDragged = draggedEntry
+    // Always clear drag state immediately on drop (success or failure)
+    setDraggedEntry(null)
+    setDragOverKey(null)
+
+    if (!evaluation.success) {
+      if (evaluation.error && onDropError) {
+        onDropError(evaluation.error)
+      }
+      return
+    }
+
+    if (evaluation.action === 'move') {
+      onMove?.(currentDragged.id, day, slotId)
+    } else if (evaluation.action === 'swap' && targetItem) {
+      onSwap?.(currentDragged.id, targetItem.entry.id)
     }
   }
 
@@ -1410,6 +1532,7 @@ export function DraftGrid({
                 cells={cells}
                 renderEntry={customRender}
                 isEditable={isEditable}
+                draggedEntry={draggedEntry}
                 onDropCell={handleDropCell}
                 dragOverKey={dragOverKey}
                 setDragOverKey={setDragOverKey}
@@ -1452,6 +1575,7 @@ export function DayRows({
   cells,
   renderEntry,
   isEditable = false,
+  draggedEntry = null,
   onDropCell,
   dragOverKey,
   setDragOverKey,
@@ -1462,7 +1586,13 @@ export function DayRows({
   cells: Map<string, { entry: DraftTimetableEntryWithRelations; isStart: boolean }[]>
   renderEntry: (slotId: string, item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }) => ReactNode
   isEditable?: boolean
-  onDropCell?: (day: DayOfWeek, slotId: string, sectionId: string, targetEntryId?: string) => void
+  draggedEntry?: DraftTimetableEntryWithRelations | null
+  onDropCell?: (
+    day: DayOfWeek,
+    slotId: string,
+    sectionId: string,
+    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+  ) => void
   dragOverKey?: string | null
   setDragOverKey?: (key: string | null) => void
 }) {
@@ -1497,13 +1627,27 @@ export function DayRows({
               const cellKey = `${day}|${slot.id}|${section.id}`
               const isOver = dragOverKey === cellKey
               const items = cells.get(`${day}|${slot.id}`)?.filter((item) => item.entry.sectionId === section.id) ?? []
+              const targetItem = items[0]
+
+              // Validate drop target when an item is being dragged
+              const dropEvaluation = draggedEntry
+                ? evaluateDraftDrop({
+                    draggedEntry,
+                    targetDay: day,
+                    targetSlotId: slot.id,
+                    targetSectionId: section.id,
+                    targetItem,
+                  })
+                : null
+              const isTargetValid = dropEvaluation ? dropEvaluation.success && dropEvaluation.action !== 'none' : true
+
               return (
                 <td
                   key={section.id}
                   onDragOver={(e) => {
                     if (isEditable) {
                       e.preventDefault()
-                      e.dataTransfer.dropEffect = 'move'
+                      e.dataTransfer.dropEffect = isTargetValid ? 'move' : 'none'
                       setDragOverKey?.(cellKey)
                     }
                   }}
@@ -1515,14 +1659,16 @@ export function DayRows({
                   onDrop={(e) => {
                     if (isEditable) {
                       e.preventDefault()
-                      const targetEntryId = items[0]?.entry.id
-                      onDropCell?.(day, slot.id, section.id, targetEntryId)
+                      onDropCell?.(day, slot.id, section.id, targetItem)
                       setDragOverKey?.(null)
                     }
                   }}
                   className={cn(
                     'border border-secondary-200 p-1.5 align-top min-w-[11rem] transition-colors',
-                    isOver && 'bg-primary-50 ring-2 ring-primary-500 ring-inset'
+                    isOver &&
+                      (isTargetValid
+                        ? 'bg-primary-50 ring-2 ring-primary-500 ring-inset'
+                        : 'bg-red-50/70 ring-2 ring-red-400 ring-inset cursor-not-allowed')
                   )}
                 >
                   {items.length === 0 ? (
