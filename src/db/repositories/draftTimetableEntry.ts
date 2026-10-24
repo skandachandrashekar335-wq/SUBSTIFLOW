@@ -41,6 +41,13 @@ export class DraftTimetableEntryRepository extends BaseRepository<DraftTimetable
     return row !== undefined
   }
 
+  /** Reset published entries back to DRAFT so the draft can be edited, re-validated and re-published. */
+  unlockForEditing(generationId: string): void {
+    this.db()
+      .prepare(`UPDATE draft_timetable_entries SET status = 'DRAFT', updated_at = datetime('now') WHERE generation_id = ?`)
+      .run(generationId)
+  }
+
   findByGenerationWithRelations(generationId: string): DraftTimetableEntryWithRelations[] {
     const rows = this.db()
       .prepare(`

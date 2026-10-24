@@ -33,7 +33,7 @@
     "predemo:remove": "node scripts/ensure-abi.js electron",
     "demo:remove": "npm run build:electron && electron scripts/demo/cli.js remove",
     "predemo:launch": "node scripts/ensure-abi.js electron",
-    "demo:launch": "node scripts/demo/launch.js",
+    "demo:launch": "npm run build && node scripts/demo/launch.js",
     "predemo:verify": "node scripts/ensure-abi.js electron",
     "demo:verify": "node scripts/demo/verify.js",
     "icon": "node scripts/make-icon.js",

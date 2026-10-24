@@ -2635,7 +2635,9 @@ export function moveDraftEntry(
     return { success: false, error: 'Generation does not exist.' }
   }
   if (draftTimetableEntryRepository.hasPublishedEntries(generationId)) {
-    return { success: false, error: 'Cannot modify a draft that has already been published.' }
+    // Automatically revert status to DRAFT so the draft can be freely edited,
+    // re-validated, and re-published to the master timetable.
+    draftTimetableEntryRepository.unlockForEditing(generationId)
   }
 
   const entries = draftTimetableEntryRepository.findByGenerationWithRelations(generationId)
@@ -2774,7 +2776,9 @@ export function swapDraftEntries(
     return { success: false, error: 'Generation does not exist.' }
   }
   if (draftTimetableEntryRepository.hasPublishedEntries(generationId)) {
-    return { success: false, error: 'Cannot modify a draft that has already been published.' }
+    // Automatically revert status to DRAFT so the draft can be freely edited,
+    // re-validated, and re-published to the master timetable.
+    draftTimetableEntryRepository.unlockForEditing(generationId)
   }
 
   const entries = draftTimetableEntryRepository.findByGenerationWithRelations(generationId)

@@ -33,7 +33,7 @@ export function DemoBanner() {
     <div
       role="status"
       data-testid="demo-banner"
-      className="sticky top-16 z-20 mb-4 flex items-start gap-3 rounded-xl border border-warning-300 bg-warning-50 px-4 py-3 shadow-sm"
+      className="mb-4 flex items-start gap-3 rounded-xl border border-warning-300 bg-warning-50 px-4 py-3 shadow-sm"
     >
       <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-warning-600" aria-hidden="true" />
       <div className="min-w-0">

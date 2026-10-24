@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback, type ReactNode } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Loader2,
@@ -107,8 +107,8 @@ export function Generation() {
     [statusInfo]
   )
   const isEditable = useMemo(
-    () => !isPublished && activeGeneration?.status === 'COMPLETED',
-    [isPublished, activeGeneration]
+    () => activeGeneration?.status === 'COMPLETED',
+    [activeGeneration]
   )
 
   const loadGenerations = useCallback(() => {
@@ -820,6 +820,15 @@ export function Generation() {
                       renderEntry={renderDraftEntry}
                       entryCount={draftEntries.length}
                       isEditable={isEditable}
+                      isPublished={isPublished}
+                      onUnlock={() => {
+                        if (activeGenerationId) {
+                          draftTimetableEntryRepository.unlockForEditing(activeGenerationId)
+                          refreshDraftData(activeGenerationId)
+                          setValidationResult(null)
+                          setNotice('Draft unlocked for editing. Re-run validation before re-publishing.')
+                        }
+                      }}
                       onMove={handleMove}
                       onSwap={handleSwap}
                       onUndo={handleUndo}
@@ -1255,7 +1264,7 @@ export function renderDraftEntry(
       }}
       onDragEnd={() => options?.onDragEnd?.()}
       className={cn(
-        'group rounded-md border p-1.5 text-xs bg-white shadow-sm transition-all',
+        'group rounded-md border p-1.5 text-xs bg-white shadow-sm transition-all select-none',
         entry.classType === 'LAB' ? 'border-purple-300 bg-purple-50/40' : 'border-secondary-200',
         isDraggable && 'cursor-grab active:cursor-grabbing hover:shadow hover:border-primary-400'
       )}
@@ -1407,6 +1416,8 @@ export function DraftGrid({
   renderEntry,
   entryCount,
   isEditable = false,
+  isPublished = false,
+  onUnlock,
   onMove,
   onSwap,
   onUndo,
@@ -1425,6 +1436,8 @@ export function DraftGrid({
   ) => ReactNode
   entryCount: number
   isEditable?: boolean
+  isPublished?: boolean
+  onUnlock?: () => void
   onMove?: (entryId: string, day: DayOfWeek, slotId: string) => void
   onSwap?: (entryIdA: string, entryIdB: string) => void
   onUndo?: () => void
@@ -1432,28 +1445,37 @@ export function DraftGrid({
   onOpenMoveDialog?: (entry: DraftTimetableEntryWithRelations) => void
   onDropError?: (error: string) => void
 }) {
-  const [draggedEntry, setDraggedEntry] = useState<DraftTimetableEntryWithRelations | null>(null)
-  const [dragOverKey, setDragOverKey] = useState<string | null>(null)
+  const draggedEntryRef = useRef<DraftTimetableEntryWithRelations | null>(null)
 
   const handleDropCell = (
     day: DayOfWeek,
     slotId: string,
     sectionId: string,
-    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean },
+    droppedEntryId?: string
   ) => {
-    if (!draggedEntry) return
+    let dragged = draggedEntryRef.current
+    if (!dragged && droppedEntryId) {
+      for (const list of cells.values()) {
+        const found = list.find((it) => it.entry.id === droppedEntryId)
+        if (found) {
+          dragged = found.entry
+          break
+        }
+      }
+    }
+    if (!dragged) return
+
     const evaluation = evaluateDraftDrop({
-      draggedEntry,
+      draggedEntry: dragged,
       targetDay: day,
       targetSlotId: slotId,
       targetSectionId: sectionId,
       targetItem,
     })
 
-    const currentDragged = draggedEntry
-    // Always clear drag state immediately on drop (success or failure)
-    setDraggedEntry(null)
-    setDragOverKey(null)
+    const currentDragged = dragged
+    draggedEntryRef.current = null
 
     if (!evaluation.success) {
       if (evaluation.error && onDropError) {
@@ -1475,10 +1497,15 @@ export function DraftGrid({
   ) => {
     return renderEntry(slotId, item, {
       isDraggable: isEditable,
-      onDragStart: (entry: DraftTimetableEntryWithRelations) => setDraggedEntry(entry),
+      onDragStart: (entry: DraftTimetableEntryWithRelations) => {
+        draggedEntryRef.current = entry
+      },
       onDragEnd: () => {
-        setDraggedEntry(null)
-        setDragOverKey(null)
+        draggedEntryRef.current = null
+        document.querySelectorAll('td[data-drag-over]').forEach((td) => {
+          td.removeAttribute('data-drag-over')
+          td.classList.remove('bg-primary-50', 'ring-2', 'ring-primary-500', 'ring-inset', 'bg-red-50/70', 'ring-red-400', 'cursor-not-allowed')
+        })
       },
       onMoveClick: (entry: DraftTimetableEntryWithRelations) => onOpenMoveDialog?.(entry),
     })
@@ -1486,6 +1513,22 @@ export function DraftGrid({
 
   return (
     <div className="space-y-2">
+      {isPublished && (
+        <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-xs">
+          <div className="flex items-center gap-2 text-amber-800">
+            <AlertTriangle className="h-4 w-4 text-amber-600 flex-shrink-0" />
+            <span>
+              <strong>Published Timetable:</strong> This timetable is currently published to the master schedule. Dragging sessions or swapping will convert it into an editable draft that you can validate and re-publish.
+            </span>
+          </div>
+          {onUnlock && (
+            <Button variant="outline" size="sm" onClick={onUnlock} className="h-7 text-xs border-amber-300 text-amber-800 hover:bg-amber-100">
+              Unlock for Editing
+            </Button>
+          )}
+        </div>
+      )}
+
       {isEditable && (
         <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-secondary-50 border border-secondary-200 rounded-lg text-xs">
           <div className="flex items-center gap-2 text-secondary-700">
@@ -1532,10 +1575,8 @@ export function DraftGrid({
                 cells={cells}
                 renderEntry={customRender}
                 isEditable={isEditable}
-                draggedEntry={draggedEntry}
+                getDraggedEntry={() => draggedEntryRef.current}
                 onDropCell={handleDropCell}
-                dragOverKey={dragOverKey}
-                setDragOverKey={setDragOverKey}
               />
             ))}
           </tbody>
@@ -1576,6 +1617,7 @@ export function DayRows({
   renderEntry,
   isEditable = false,
   draggedEntry = null,
+  getDraggedEntry,
   onDropCell,
   dragOverKey,
   setDragOverKey,
@@ -1587,11 +1629,13 @@ export function DayRows({
   renderEntry: (slotId: string, item: { entry: DraftTimetableEntryWithRelations; isStart: boolean }) => ReactNode
   isEditable?: boolean
   draggedEntry?: DraftTimetableEntryWithRelations | null
+  getDraggedEntry?: () => DraftTimetableEntryWithRelations | null
   onDropCell?: (
     day: DayOfWeek,
     slotId: string,
     sectionId: string,
-    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean }
+    targetItem?: { entry: DraftTimetableEntryWithRelations; isStart: boolean },
+    droppedEntryId?: string
   ) => void
   dragOverKey?: string | null
   setDragOverKey?: (key: string | null) => void
@@ -1609,9 +1653,6 @@ export function DayRows({
         <tr key={`${day}-${slot.id}`} className={slot.isBreak ? 'bg-amber-50' : undefined}>
           <td className="border border-secondary-200 p-2 text-xs text-secondary-600 whitespace-nowrap sticky left-0 bg-white">
             <div className="font-medium">{slot.name}</div>
-            {/* Only when the name does not already carry the range — the
-                default periods are named "09:00-10:00", which used to make
-                this cell print the same label twice. */}
             {!periodNameIncludesTime(slot) && (
               <div className="text-secondary-400">
                 {slot.startTime}–{slot.endTime}
@@ -1624,55 +1665,77 @@ export function DayRows({
             </td>
           ) : (
             sections.map((section) => {
-              const cellKey = `${day}|${slot.id}|${section.id}`
-              const isOver = dragOverKey === cellKey
               const items = cells.get(`${day}|${slot.id}`)?.filter((item) => item.entry.sectionId === section.id) ?? []
               const targetItem = items[0]
-
-              // Validate drop target when an item is being dragged
-              const dropEvaluation = draggedEntry
-                ? evaluateDraftDrop({
-                    draggedEntry,
-                    targetDay: day,
-                    targetSlotId: slot.id,
-                    targetSectionId: section.id,
-                    targetItem,
-                  })
-                : null
-              const isTargetValid = dropEvaluation ? dropEvaluation.success && dropEvaluation.action !== 'none' : true
 
               return (
                 <td
                   key={section.id}
-                  onDragOver={(e) => {
-                    if (isEditable) {
-                      e.preventDefault()
-                      e.dataTransfer.dropEffect = isTargetValid ? 'move' : 'none'
-                      setDragOverKey?.(cellKey)
+                  onDragEnter={(e) => {
+                    if (!isEditable) return
+                    e.preventDefault()
+                    const dragged = getDraggedEntry ? getDraggedEntry() : draggedEntry
+                    const td = e.currentTarget
+                    td.setAttribute('data-drag-over', 'true')
+                    if (dragged) {
+                      const dropEvaluation = evaluateDraftDrop({
+                        draggedEntry: dragged,
+                        targetDay: day,
+                        targetSlotId: slot.id,
+                        targetSectionId: section.id,
+                        targetItem,
+                      })
+                      const isTargetValid = dropEvaluation.success && dropEvaluation.action !== 'none'
+                      if (isTargetValid) {
+                        td.classList.add('bg-primary-50', 'ring-2', 'ring-primary-500', 'ring-inset')
+                        td.classList.remove('bg-red-50/70', 'ring-red-400', 'cursor-not-allowed')
+                      } else {
+                        td.classList.add('bg-red-50/70', 'ring-2', 'ring-red-400', 'ring-inset', 'cursor-not-allowed')
+                        td.classList.remove('bg-primary-50', 'ring-primary-500')
+                      }
+                    } else {
+                      td.classList.add('bg-primary-50', 'ring-2', 'ring-primary-500', 'ring-inset')
                     }
                   }}
-                  onDragLeave={() => {
-                    if (isEditable && dragOverKey === cellKey) {
-                      setDragOverKey?.(null)
+                  onDragOver={(e) => {
+                    if (!isEditable) return
+                    e.preventDefault()
+                    const dragged = getDraggedEntry ? getDraggedEntry() : draggedEntry
+                    if (dragged) {
+                      const dropEvaluation = evaluateDraftDrop({
+                        draggedEntry: dragged,
+                        targetDay: day,
+                        targetSlotId: slot.id,
+                        targetSectionId: section.id,
+                        targetItem,
+                      })
+                      const isTargetValid = dropEvaluation.success && dropEvaluation.action !== 'none'
+                      e.dataTransfer.dropEffect = isTargetValid ? 'move' : 'none'
+                    } else {
+                      e.dataTransfer.dropEffect = 'move'
+                    }
+                  }}
+                  onDragLeave={(e) => {
+                    if (!isEditable) return
+                    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                      const td = e.currentTarget
+                      td.removeAttribute('data-drag-over')
+                      td.classList.remove('bg-primary-50', 'ring-2', 'ring-primary-500', 'ring-inset', 'bg-red-50/70', 'ring-red-400', 'cursor-not-allowed')
                     }
                   }}
                   onDrop={(e) => {
-                    if (isEditable) {
-                      e.preventDefault()
-                      onDropCell?.(day, slot.id, section.id, targetItem)
-                      setDragOverKey?.(null)
-                    }
+                    if (!isEditable) return
+                    e.preventDefault()
+                    const td = e.currentTarget
+                    td.removeAttribute('data-drag-over')
+                    td.classList.remove('bg-primary-50', 'ring-2', 'ring-primary-500', 'ring-inset', 'bg-red-50/70', 'ring-red-400', 'cursor-not-allowed')
+                    const droppedId = e.dataTransfer.getData('text/plain')
+                    onDropCell?.(day, slot.id, section.id, targetItem, droppedId)
                   }}
-                  className={cn(
-                    'border border-secondary-200 p-1.5 align-top min-w-[11rem] transition-colors',
-                    isOver &&
-                      (isTargetValid
-                        ? 'bg-primary-50 ring-2 ring-primary-500 ring-inset'
-                        : 'bg-red-50/70 ring-2 ring-red-400 ring-inset cursor-not-allowed')
-                  )}
+                  className="border border-secondary-200 p-1.5 align-top min-w-[11rem] transition-colors"
                 >
                   {items.length === 0 ? (
-                    <span className="text-secondary-300 text-xs">—</span>
+                    <span className="text-secondary-300 text-xs pointer-events-none">—</span>
                   ) : (
                     <div className="space-y-1">{items.map((item) => renderEntry(slot.id, item))}</div>
                   )}
