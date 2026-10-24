@@ -171,6 +171,25 @@ const MAX_FAILURE_DIAGNOSTICS = 20
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect whether a subject represents an Indian Language course that requires
+ * semester-wide synchronization across sections of that semester.
+ */
+export function isLanguageSubject(
+  subject?: { name?: string | null; code?: string | null } | null
+): boolean {
+  if (!subject) return false
+  const code = (subject.code || '').trim().toUpperCase()
+  const name = (subject.name || '').trim().toUpperCase()
+  if (!code && !name) return false
+  if (code === 'IL' || name === 'IL') return true
+  if (code.startsWith('IL-') || code.endsWith('-IL') || code.includes('/IL') || code.includes('IL/')) return true
+  if (/\b(IL|INDIAN LANGUAGE|KANNADA|HINDI|SANSKRIT|TAMIL|TELUGU|MALAYALAM|MARATHI|URDU)\b/i.test(name)) return true
+  if (/\b(INDIAN LANGUAGE|KANNADA|HINDI|SANSKRIT|TAMIL|TELUGU|MALAYALAM|MARATHI|URDU)\b/i.test(code)) return true
+  if (/^24BCAL[13]2$/i.test(code)) return true
+  return false
+}
+
 /** One unit of work: a single weekly session of one requirement. */
 interface SchedulingTask {
   /** Deterministic identity: section|subject|classType#sessionIndex. */
@@ -183,6 +202,9 @@ interface SchedulingTask {
   allocationIds: string[]
   sectionId: string
   sectionName: string
+  semester: number
+  isLanguage: boolean
+  languageSyncKey?: string
   subjectId: string
   subjectName: string
   subjectCode: string
@@ -241,6 +263,8 @@ interface SolverContext {
   /** Number of usable teaching periods per working day. */
   teachingPeriodCount: number
   preferSpread: boolean
+  syncIndianLanguages: boolean
+  languageSyncPeerTasks: Map<string, SchedulingTask[]>
 }
 
 interface SolverState {
@@ -253,6 +277,7 @@ interface SolverState {
   facultyDay: Map<string, number> // "facultyId|day" -> periods
   facultyPeriods: Map<string, number>
   facultyGroupSessions: Map<string, number> // "facultyId|baseKey" -> sessions
+  languagePlacementsBySyncKey: Map<string, Placement[]>
   assigned: Placement[]
   assignedKeys: Set<string>
   attempts: number
@@ -383,6 +408,7 @@ interface LoadedData {
   maxAttempts: number
   timeoutMs: number
   preferSpread: boolean
+  syncIndianLanguages: boolean
 }
 
 function loadAllData(academicYearId: string): LoadedData {
@@ -425,6 +451,7 @@ function loadAllData(academicYearId: string): LoadedData {
     maxAttempts: settingsRepository.getMaxGenerationAttempts(),
     timeoutMs: settingsRepository.getGenerationTimeoutMs(),
     preferSpread: settingsRepository.getPreferSpread(),
+    syncIndianLanguages: settingsRepository.getSyncIndianLanguages(),
   }
 }
 
@@ -450,6 +477,7 @@ function buildConstraintsSnapshot(data: LoadedData): GenerationConstraintsSnapsh
     workingHours: { ...data.workingHours, slots: data.orderedSlots },
     multiFacultyAbsencePolicy: settingsRepository.getMultiFacultyAbsencePolicy(),
     maxDailySubstitutions,
+    syncIndianLanguages: data.syncIndianLanguages,
   }
 }
 
@@ -524,6 +552,8 @@ function buildContext(data: LoadedData): SolverContext {
     teachingOrdinalBySlotId,
     teachingPeriodCount: teachingOrdinal,
     preferSpread: data.preferSpread,
+    syncIndianLanguages: data.syncIndianLanguages,
+    languageSyncPeerTasks: new Map(),
   }
 }
 
@@ -929,6 +959,158 @@ function validateInputs(data: LoadedData, ctx: SolverContext): NewDiagnostic[] {
     )
   }
 
+  // -------------------------------------------------------------------------
+  // Semester-wide Indian Language synchronization checks
+  // -------------------------------------------------------------------------
+  if (data.syncIndianLanguages) {
+    const semSections = new Map<number, Section[]>()
+    for (const sec of data.sections) {
+      const list = semSections.get(sec.semester) ?? []
+      list.push(sec)
+      semSections.set(sec.semester, list)
+    }
+
+    const subjectsById = new Map(data.subjects.map((s) => [s.id, s]))
+
+    for (const [semester, sections] of semSections.entries()) {
+      if (sections.length <= 1) continue
+
+      const secLangReqs = new Map<string, SubjectRequirement[]>()
+      for (const sec of sections) {
+        const reqs = data.requirements.filter((r) => {
+          if (r.sectionId !== sec.id) return false
+          const sub = subjectsById.get(r.subjectId)
+          return isLanguageSubject(sub)
+        })
+        if (reqs.length > 0) {
+          secLangReqs.set(sec.id, reqs)
+        }
+      }
+
+      if (secLangReqs.size > 0) {
+        // Warning if some sections in semester have language and others do not
+        const missingSections = sections.filter((s) => !secLangReqs.has(s.id))
+        if (missingSections.length > 0 && secLangReqs.size > 0) {
+          out.push(
+            diagnostic(
+              'WARNING',
+              GenerationDiagnosticCode.LANGUAGE_SYNC_CONFLICT,
+              `Semester ${semester} Indian Language synchronization: ${secLangReqs.size} section(s) have language requirements, but ${missingSections.map((s) => s.name).join(', ')} do not.`,
+              {
+                ...scope,
+                semester,
+                participating: Array.from(secLangReqs.keys()),
+                missing: missingSections.map((s) => s.name),
+                suggestedAction: 'Add matching Indian Language requirements to all sections in this semester if they are meant to be synchronized.',
+              }
+            )
+          )
+        }
+
+        // Mismatched session counts or spans across participating sections
+        const reqEntries = Array.from(secLangReqs.entries())
+        const [firstSecId, firstReqs] = reqEntries[0]
+        const firstSec = sections.find((s) => s.id === firstSecId)
+        const firstTotalSessions = firstReqs.reduce((sum, r) => sum + r.requiredSessionsPerWeek, 0)
+        const firstSpans = firstReqs.map((r) => r.span).sort()
+
+        for (let i = 1; i < reqEntries.length; i++) {
+          const [otherSecId, otherReqs] = reqEntries[i]
+          const otherSec = sections.find((s) => s.id === otherSecId)
+          const otherTotalSessions = otherReqs.reduce((sum, r) => sum + r.requiredSessionsPerWeek, 0)
+          const otherSpans = otherReqs.map((r) => r.span).sort()
+
+          if (firstTotalSessions !== otherTotalSessions || JSON.stringify(firstSpans) !== JSON.stringify(otherSpans)) {
+            out.push(
+              diagnostic(
+                'ERROR',
+                GenerationDiagnosticCode.INPUT_INVALID,
+                `Semester-wide Indian Language synchronization mismatch: Sections in Semester ${semester} have unequal language requirements (${firstSec?.name}: ${firstTotalSessions} sessions span [${firstSpans.join(', ')}] vs ${otherSec?.name}: ${otherTotalSessions} sessions span [${otherSpans.join(', ')}]).`,
+                {
+                  ...scope,
+                  semester,
+                  sectionA: firstSec?.name,
+                  sessionsA: firstTotalSessions,
+                  sectionB: otherSec?.name,
+                  sessionsB: otherTotalSessions,
+                  suggestedAction: 'Ensure all sections in the same semester have identical weekly session counts and durations for Indian Language.',
+                }
+              )
+            )
+          }
+        }
+
+        // Shared faculty conflict across synchronized sections
+        const facultyBySection = new Map<string, Set<string>>()
+        for (const [secId, reqs] of secLangReqs.entries()) {
+          const facSet = new Set<string>()
+          for (const req of reqs) {
+            const allocs = data.allocations.filter(
+              (a) => a.sectionId === secId && a.subjectId === req.subjectId && a.classType === req.classType
+            )
+            for (const a of allocs) facSet.add(a.facultyId)
+          }
+          facultyBySection.set(secId, facSet)
+        }
+
+        for (let i = 0; i < reqEntries.length; i++) {
+          for (let j = i + 1; j < reqEntries.length; j++) {
+            const secIdA = reqEntries[i][0]
+            const secIdB = reqEntries[j][0]
+            const secA = sections.find((s) => s.id === secIdA)
+            const secB = sections.find((s) => s.id === secIdB)
+            const facA = facultyBySection.get(secIdA) ?? new Set()
+            const facB = facultyBySection.get(secIdB) ?? new Set()
+
+            const shared = Array.from(facA).filter((f) => facB.has(f))
+            if (shared.length > 0) {
+              const facNames = shared
+                .map((id) => data.faculty.find((f) => f.id === id)?.name ?? id)
+                .join(', ')
+              out.push(
+                diagnostic(
+                  'ERROR',
+                  GenerationDiagnosticCode.LANGUAGE_SYNC_CONFLICT,
+                  `Semester-wide Indian Language synchronization conflict: Sections ${secA?.name} and ${secB?.name} in Semester ${semester} share faculty member(s): ${facNames}. Because both sections must hold Indian Language simultaneously, a teacher cannot be in two rooms at once.`,
+                  {
+                    ...scope,
+                    semester,
+                    sectionA: secA?.name,
+                    sectionB: secB?.name,
+                    sharedFaculty: shared,
+                    suggestedAction: 'Allocate distinct faculty to each section for Indian Language, or disable Indian Language synchronization in Settings.',
+                  }
+                )
+              )
+            }
+          }
+        }
+
+        // Room capacity for simultaneous sessions
+        const labReqCount = Array.from(secLangReqs.values()).filter((reqs) =>
+          reqs.some((r) => r.classType === 'LAB')
+        ).length
+        const labRoomCount = data.rooms.filter((r) => r.type === 'LAB').length
+        if (labReqCount > labRoomCount) {
+          out.push(
+            diagnostic(
+              'ERROR',
+              GenerationDiagnosticCode.LANGUAGE_SYNC_CONFLICT,
+              `Semester-wide Indian Language synchronization conflict: Semester ${semester} has ${labReqCount} sections requiring lab rooms simultaneously for Indian Language, but only ${labRoomCount} lab room(s) exist.`,
+              {
+                ...scope,
+                semester,
+                requiredLabRooms: labReqCount,
+                availableLabRooms: labRoomCount,
+                suggestedAction: 'Add more lab rooms or reconfigure class types if computer labs are not required.',
+              }
+            )
+          )
+        }
+      }
+    }
+  }
+
   return out
 }
 
@@ -1025,9 +1207,12 @@ function buildTasks(data: LoadedData): SchedulingTask[] {
     const section = sectionsById.get(req.sectionId)
     const subject = subjectsById.get(req.subjectId)
     const baseKey = `${req.sectionId}|${req.subjectId}|${req.classType}`
+    const isLang = (data.syncIndianLanguages ?? true) && isLanguageSubject(subject ?? { name: '', code: '' })
+    const semester = section?.semester ?? 1
 
     const difficulty =
       (Math.max(1, req.span) > 1 ? 1000 : 0) +
+      (isLang ? 600 : 0) +
       (facultyPool.length > 1 && isLab ? 500 : 0) +
       (isLab ? 200 : 0) +
       (4 - Math.min(4, facultyPool.length)) * 20 +
@@ -1043,6 +1228,9 @@ function buildTasks(data: LoadedData): SchedulingTask[] {
         allocationIds: group.map((a) => a.id),
         sectionId: req.sectionId,
         sectionName: section?.name ?? 'Unknown section',
+        semester,
+        isLanguage: isLang,
+        languageSyncKey: isLang ? `sem:${semester}#${i}` : undefined,
         subjectId: req.subjectId,
         subjectName: subject?.name ?? 'Unknown subject',
         subjectCode: subject?.code ?? '',
@@ -1078,6 +1266,7 @@ function createState(): SolverState {
     facultyDay: new Map(),
     facultyPeriods: new Map(),
     facultyGroupSessions: new Map(),
+    languagePlacementsBySyncKey: new Map(),
     assigned: [],
     assignedKeys: new Set(),
     attempts: 0,
@@ -1124,6 +1313,14 @@ function place(state: SolverState, p: Placement): void {
     bump(state.facultyPeriods, f, keys.length)
     bump(state.facultyGroupSessions, `${f}|${p.task.baseKey}`, 1)
   }
+  if (p.task.languageSyncKey) {
+    let list = state.languagePlacementsBySyncKey.get(p.task.languageSyncKey)
+    if (!list) {
+      list = []
+      state.languagePlacementsBySyncKey.set(p.task.languageSyncKey, list)
+    }
+    list.push(p)
+  }
   state.assigned.push(p)
   state.assignedKeys.add(p.task.key)
 }
@@ -1144,6 +1341,14 @@ function unplace(state: SolverState, p: Placement): void {
     bump(state.facultyDay, `${f}|${p.day}`, -keys.length)
     bump(state.facultyPeriods, f, -keys.length)
     bump(state.facultyGroupSessions, `${f}|${p.task.baseKey}`, -1)
+  }
+  if (p.task.languageSyncKey) {
+    const list = state.languagePlacementsBySyncKey.get(p.task.languageSyncKey)
+    if (list) {
+      const idx = list.indexOf(p)
+      if (idx !== -1) list.splice(idx, 1)
+      if (list.length === 0) state.languagePlacementsBySyncKey.delete(p.task.languageSyncKey)
+    }
   }
   state.assigned.pop()
   state.assignedKeys.delete(p.task.key)
@@ -1311,6 +1516,38 @@ function candidatesFor(
   for (let d = 0; d < ctx.days.length; d++) {
     const day = ctx.days[d]
     for (const window of windows) {
+      // Semester-wide Indian Language synchronization constraint
+      if (task.languageSyncKey) {
+        const existing = state.languagePlacementsBySyncKey.get(task.languageSyncKey)
+        if (existing && existing.length > 0) {
+          const anchor = existing[0]
+          if (day !== anchor.day || window.startIdx !== anchor.window.startIdx) {
+            continue
+          }
+        } else {
+          // First placement of this sync group: ensure candidate slot is feasible for peer sections & faculty
+          const peers = ctx.languageSyncPeerTasks.get(task.languageSyncKey) ?? []
+          const keys = slotKeysFor(day, window.slotIds)
+          let feasible = true
+          for (const peer of peers) {
+            if (peer.key === task.key) continue
+            if (!isFree(state.sectionBusy, peer.sectionId, keys)) {
+              feasible = false
+              break
+            }
+            const peerChoices = facultyChoicesFor(peer)
+            const hasFreeChoice = peerChoices.some(
+              (choice) => choice.length > 0 && choice.every((f) => isFree(state.facultyBusy, f, keys))
+            )
+            if (!hasFreeChoice) {
+              feasible = false
+              break
+            }
+          }
+          if (!feasible) continue
+        }
+      }
+
       const keys = slotKeysFor(day, window.slotIds)
       if (!isFree(state.sectionBusy, task.sectionId, keys)) continue
 
@@ -1321,7 +1558,18 @@ function candidatesFor(
       }
       if (freeChoices.length === 0) continue
 
-      const freeRooms = task.rooms.filter((r) => isFree(state.roomBusy, r, keys))
+      // Room exclusion for peers already placed in this slot
+      const usedRoomsInSlot = new Set<string>()
+      if (task.languageSyncKey) {
+        const existing = state.languagePlacementsBySyncKey.get(task.languageSyncKey)
+        if (existing) {
+          for (const p of existing) {
+            if (p.roomId) usedRoomsInSlot.add(p.roomId)
+          }
+        }
+      }
+
+      const freeRooms = task.rooms.filter((r) => !usedRoomsInSlot.has(r) && isFree(state.roomBusy, r, keys))
       if (task.roomRequired && freeRooms.length === 0) continue
       const roomOptions: (string | null)[] = freeRooms.length > 0 ? [freeRooms[0]] : [null]
 
@@ -1823,6 +2071,16 @@ export function generateTimetable(academicYearId: string): GenerationResult {
 
     // 2. Expand requirements into scheduling units.
     const tasks = buildTasks(data)
+    for (const t of tasks) {
+      if (t.languageSyncKey) {
+        let list = ctx.languageSyncPeerTasks.get(t.languageSyncKey)
+        if (!list) {
+          list = []
+          ctx.languageSyncPeerTasks.set(t.languageSyncKey, list)
+        }
+        list.push(t)
+      }
+    }
     if (tasks.length === 0) {
       return finishFailure(
         [
@@ -2236,6 +2494,59 @@ export function validateDraftTimetable(generationId: string): DraftValidationRes
     result.errors.push(
       `${sectionName} · ${subjectName} (${scheduled[0].classType}): draft contains ${scheduled.length} session(s) but no Subject Requirement defines them.`
     )
+  }
+
+  // 9. Semester-wide Indian Language synchronization constraint
+  const syncLang = settingsRepository.getSyncIndianLanguages()
+  if (syncLang) {
+    const langEntries = entries.filter((e) => isLanguageSubject(e.subject))
+    const semMap = new Map<number, typeof langEntries>()
+    for (const e of langEntries) {
+      const sec = sectionsById.get(e.sectionId)
+      const sem = sec?.semester ?? 1
+      const list = semMap.get(sem) ?? []
+      list.push(e)
+      semMap.set(sem, list)
+    }
+
+    for (const [semester, list] of semMap.entries()) {
+      const secEntries = new Map<string, typeof list>()
+      for (const e of list) {
+        const secList = secEntries.get(e.sectionId) ?? []
+        secList.push(e)
+        secEntries.set(e.sectionId, secList)
+      }
+
+      if (secEntries.size > 1) {
+        const sectionList = Array.from(secEntries.entries())
+        const [firstSecId, firstList] = sectionList[0]
+        const firstSecName = sectionsById.get(firstSecId)?.name ?? firstSecId
+        firstList.sort((a, b) => a.dayOfWeek.localeCompare(b.dayOfWeek) || a.timeSlotId.localeCompare(b.timeSlotId))
+
+        for (let i = 1; i < sectionList.length; i++) {
+          const [secId, otherList] = sectionList[i]
+          const secName = sectionsById.get(secId)?.name ?? secId
+          otherList.sort((a, b) => a.dayOfWeek.localeCompare(b.dayOfWeek) || a.timeSlotId.localeCompare(b.timeSlotId))
+
+          if (firstList.length !== otherList.length) {
+            result.errors.push(
+              `Semester-wide language synchronization violation: Semester ${semester} sections have unequal Indian Language session counts (${firstSecName}: ${firstList.length} vs ${secName}: ${otherList.length}).`
+            )
+            continue
+          }
+
+          for (let sIdx = 0; sIdx < firstList.length; sIdx++) {
+            const e1 = firstList[sIdx]
+            const e2 = otherList[sIdx]
+            if (e1.dayOfWeek !== e2.dayOfWeek || e1.timeSlotId !== e2.timeSlotId) {
+              result.errors.push(
+                `Semester-wide language synchronization violation: Semester ${semester} sections have Indian Language scheduled at different slots: ${firstSecName} at ${e1.dayOfWeek} ${describeEntry(e1, slotById)} vs ${secName} at ${e2.dayOfWeek} ${describeEntry(e2, slotById)}.`
+              )
+            }
+          }
+        }
+      }
+    }
   }
 
   result.valid = result.errors.length === 0
@@ -2694,42 +3005,89 @@ export function moveDraftEntry(
     }
   }
 
-  // Check conflicts with other entries in this generation on targetDay
+  // Identify synchronized language peers that must move together
+  const syncLang = settingsRepository.getSyncIndianLanguages()
+  const isLang = syncLang && isLanguageSubject(entry.subject)
+  let allToMove = [entry]
+
+  if (isLang) {
+    const sec = data.sections.find((s) => s.id === entry.sectionId)
+    const sem = sec?.semester ?? 1
+    const peers = entries.filter(
+      (e) =>
+        e.id !== entry.id &&
+        isLanguageSubject(e.subject) &&
+        data.sections.find((s) => s.id === e.sectionId)?.semester === sem &&
+        e.dayOfWeek === entry.dayOfWeek &&
+        e.timeSlotId === entry.timeSlotId
+    )
+    if (peers.length > 0) {
+      allToMove = [entry, ...peers]
+    }
+  }
+
+  const allToMoveIds = new Set(allToMove.map((e) => e.id))
   const targetSlotIds = new Set(covered.slots.map((s) => s.id))
-  const otherEntries = entries.filter((e) => e.id !== entryId && e.dayOfWeek === targetDay)
-  const entryFacultyIds = new Set((entry.facultyList ?? []).map((f) => f.id))
-  const entryRoomIds = new Set((entry.roomList ?? []).map((r) => r.id))
+  const otherEntries = entries.filter((e) => !allToMoveIds.has(e.id) && e.dayOfWeek === targetDay)
 
-  for (const other of otherEntries) {
-    const otherCovered = resolveCoveredSlots(other.timeSlotId, other.span)
-    if ('error' in otherCovered) continue
-    const overlaps = otherCovered.slots.some((s) => targetSlotIds.has(s.id))
-    if (!overlaps) continue
-
-    if (other.sectionId === entry.sectionId) {
-      const secName = other.section?.name ?? 'This section'
-      const subName = other.subject?.name ?? 'another class'
-      return {
-        success: false,
-        error: `Section conflict: ${secName} already has ${subName} scheduled during this period.`,
-      }
+  // Verify each item to move against external entries on targetDay
+  for (const item of allToMove) {
+    const itemSpan = Math.max(1, item.span || 1)
+    const itemCovered = resolveCoveredSlots(targetTimeSlotId, itemSpan)
+    if ('error' in itemCovered) {
+      return { success: false, error: itemCovered.error }
     }
+    const itemSlotIds = new Set(itemCovered.slots.map((s) => s.id))
+    const itemFacultyIds = new Set((item.facultyList ?? []).map((f) => f.id))
+    const itemRoomIds = new Set((item.roomList ?? []).map((r) => r.id))
 
-    for (const fac of other.facultyList ?? []) {
-      if (entryFacultyIds.has(fac.id)) {
+    for (const other of otherEntries) {
+      const otherCovered = resolveCoveredSlots(other.timeSlotId, other.span)
+      if ('error' in otherCovered) continue
+      const overlaps = otherCovered.slots.some((s) => itemSlotIds.has(s.id))
+      if (!overlaps) continue
+
+      if (other.sectionId === item.sectionId) {
+        const secName = other.section?.name ?? item.section?.name ?? 'This section'
+        const subName = other.subject?.name ?? 'another class'
         return {
           success: false,
-          error: `Faculty conflict: ${fac.name} is already teaching ${other.subject?.name ?? 'a class'} (${other.section?.name ?? ''}) during this period.`,
+          error: `Section conflict: ${secName} already has ${subName} scheduled during this period.`,
+        }
+      }
+
+      for (const fac of other.facultyList ?? []) {
+        if (itemFacultyIds.has(fac.id)) {
+          return {
+            success: false,
+            error: `Faculty conflict: ${fac.name} is already teaching ${other.subject?.name ?? 'a class'} (${other.section?.name ?? ''}) during this period.`,
+          }
+        }
+      }
+
+      for (const room of other.roomList ?? []) {
+        if (itemRoomIds.has(room.id)) {
+          return {
+            success: false,
+            error: `Room conflict: ${room.name} is already booked by ${other.section?.name ?? 'another section'} during this period.`,
+          }
         }
       }
     }
+  }
 
-    for (const room of other.roomList ?? []) {
-      if (entryRoomIds.has(room.id)) {
-        return {
-          success: false,
-          error: `Room conflict: ${room.name} is already booked by ${other.section?.name ?? 'another section'} during this period.`,
+  // Verify no room conflict among the moving synchronized sessions
+  if (allToMove.length > 1) {
+    const distinctRooms = new Set<string>()
+    for (const item of allToMove) {
+      for (const room of item.roomList ?? []) {
+        if (distinctRooms.has(room.id)) {
+          return {
+            success: false,
+            error: `Room conflict: synchronized sections cannot share room "${room.name}" simultaneously.`,
+          }
         }
+        distinctRooms.add(room.id)
       }
     }
   }
@@ -2737,11 +3095,12 @@ export function moveDraftEntry(
   // Valid! Execute in transaction
   try {
     withTransaction(() => {
-      getDatabase()
-        .prepare(
-          'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
-        )
-        .run(targetDay, targetTimeSlotId, entryId)
+      const stmt = getDatabase().prepare(
+        'UPDATE draft_timetable_entries SET day_of_week = ?, time_slot_id = ?, updated_at = datetime(\'now\') WHERE id = ?'
+      )
+      for (const item of allToMove) {
+        stmt.run(targetDay, targetTimeSlotId, item.id)
+      }
     })
   } catch (err) {
     return {
@@ -2789,6 +3148,30 @@ export function swapDraftEntries(
   }
 
   const data = loadAllData(generation.academicYearId)
+
+  // Guard: swapping cannot desynchronize semester-wide Indian Language sessions
+  const syncLang = settingsRepository.getSyncIndianLanguages()
+  if (syncLang && (isLanguageSubject(entryA.subject) || isLanguageSubject(entryB.subject))) {
+    for (const item of [entryA, entryB]) {
+      if (isLanguageSubject(item.subject)) {
+        const itemSec = data.sections.find((s) => s.id === item.sectionId)
+        const itemSem = itemSec?.semester ?? 1
+        const hasPeers = entries.some(
+          (e) =>
+            e.id !== item.id &&
+            isLanguageSubject(e.subject) &&
+            data.sections.find((s) => s.id === e.sectionId)?.semester === itemSem
+        )
+        if (hasPeers) {
+          return {
+            success: false,
+            error: `Cannot swap Indian Language session: semester-wide synchronization requires all sections of Semester ${itemSem} to share the same slot. Move the synchronized session group together instead.`,
+          }
+        }
+      }
+    }
+  }
+
   const hours = data.workingHours
   const breakStart = timeToMinutes(hours.breakStart)
   const breakEnd = timeToMinutes(hours.breakEnd)

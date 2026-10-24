@@ -200,6 +200,7 @@ const SETTINGS: Array<{ key: string; value: string; description: string }> = [
   { key: 'break_end', value: '14:00', description: 'Break end time' },
   { key: 'working_days', value: 'MONDAY,TUESDAY,WEDNESDAY,THURSDAY,FRIDAY,SATURDAY', description: 'Working days (demo week)' },
   { key: 'max_daily_substitutions', value: '2', description: 'Maximum daily substitutions per faculty' },
+  { key: 'sync_indian_languages', value: 'true', description: 'Synchronize Indian Language sessions across sections of each semester' },
 ]
 
 /** Qualifications: each subject has a primary teacher plus backup staff for substitution. */
@@ -217,6 +218,8 @@ const QUALIFICATIONS: Array<{ facultyId: string; subjectId: string; proficiency:
   { facultyId: 'demo-fac-09', subjectId: 'sub-24bcal11', proficiency: 3 }, // GE lab (I) (backup)
   { facultyId: 'demo-fac-09', subjectId: 'sub-24bcal12', proficiency: 5 }, // IL lab (I)
   { facultyId: 'demo-fac-10', subjectId: 'sub-24bcal12', proficiency: 5 }, // IL lab (I)
+  { facultyId: 'demo-fac-11', subjectId: 'sub-24bcal12', proficiency: 5 }, // IL lab (I)
+  { facultyId: 'demo-fac-12', subjectId: 'sub-24bcal12', proficiency: 5 }, // IL lab (I)
   { facultyId: 'demo-fac-12', subjectId: 'sub-24bcal13', proficiency: 5 }, // DMS Lab
   { facultyId: 'demo-fac-01', subjectId: 'sub-24bcal13', proficiency: 4 }, // DMS Lab (backup)
   { facultyId: 'demo-fac-01', subjectId: 'sub-24bcat11', proficiency: 5 }, // Tutorial (I)
@@ -239,6 +242,8 @@ const QUALIFICATIONS: Array<{ facultyId: string; subjectId: string; proficiency:
   { facultyId: 'demo-fac-05', subjectId: 'sub-24bcal31', proficiency: 4 }, // GE lab (III) (backup)
   { facultyId: 'demo-fac-09', subjectId: 'sub-24bcal32', proficiency: 5 }, // IL lab (III)
   { facultyId: 'demo-fac-10', subjectId: 'sub-24bcal32', proficiency: 5 }, // IL lab (III)
+  { facultyId: 'demo-fac-11', subjectId: 'sub-24bcal32', proficiency: 5 }, // IL lab (III)
+  { facultyId: 'demo-fac-12', subjectId: 'sub-24bcal32', proficiency: 5 }, // IL lab (III)
   { facultyId: 'demo-fac-06', subjectId: 'sub-24bcal33', proficiency: 5 }, // DBMS Lab
   { facultyId: 'demo-fac-09', subjectId: 'sub-24bcal33', proficiency: 4 }, // DBMS Lab (backup)
   { facultyId: 'demo-fac-11', subjectId: 'sub-24bcat31', proficiency: 5 }, // AI Tutorial
@@ -355,16 +360,81 @@ export interface DemoFixtureCounts {
   sectionAssignments: number
 }
 
-function planRowCounts(): { requirements: number; allocations: number } {
+export function getPlanForSection(section: SectionSpec): RequirementSpec[] {
+  const base = SEMESTER_PLAN[section.semester]
+  if (section.id === 'sec-i-b') {
+    return base.map((spec) => {
+      if (spec.subjectId === 'sub-24bcal12') {
+        return {
+          ...spec,
+          faculty: [
+            { facultyId: 'demo-fac-10', sessions: 1 },
+            { facultyId: 'demo-fac-12', sessions: 1 },
+          ],
+        }
+      }
+      return spec
+    })
+  }
+  if (section.id === 'sec-i-a') {
+    return base.map((spec) => {
+      if (spec.subjectId === 'sub-24bcal12') {
+        return {
+          ...spec,
+          faculty: [
+            { facultyId: 'demo-fac-09', sessions: 1 },
+            { facultyId: 'demo-fac-11', sessions: 1 },
+          ],
+        }
+      }
+      return spec
+    })
+  }
+  if (section.id === 'sec-iii-b') {
+    return base.map((spec) => {
+      if (spec.subjectId === 'sub-24bcal32') {
+        return {
+          ...spec,
+          faculty: [
+            { facultyId: 'demo-fac-10', sessions: 1 },
+            { facultyId: 'demo-fac-12', sessions: 1 },
+          ],
+        }
+      }
+      return spec
+    })
+  }
+  if (section.id === 'sec-iii-a') {
+    return base.map((spec) => {
+      if (spec.subjectId === 'sub-24bcal32') {
+        return {
+          ...spec,
+          faculty: [
+            { facultyId: 'demo-fac-09', sessions: 1 },
+            { facultyId: 'demo-fac-11', sessions: 1 },
+          ],
+        }
+      }
+      return spec
+    })
+  }
+  return base
+}
+
+function planRowCounts(): { requirements: number; allocations: number; sectionAssignments: number } {
   let requirements = 0
   let allocations = 0
+  const pairs = new Set<string>()
   for (const section of SECTIONS) {
-    for (const spec of SEMESTER_PLAN[section.semester]) {
+    for (const spec of getPlanForSection(section)) {
       requirements += 1
       allocations += spec.faculty.length
+      for (const a of spec.faculty) {
+        pairs.add(`${a.facultyId}|${section.id}`)
+      }
     }
   }
-  return { requirements, allocations }
+  return { requirements, allocations, sectionAssignments: pairs.size }
 }
 
 const PLAN_COUNTS = planRowCounts()
@@ -390,11 +460,11 @@ export const DEMO_EXPECTED_COUNTS: DemoFixtureCounts = {
   classrooms: ROOMS.filter((r) => r.type === 'CLASSROOM').length, // 4
   labs: ROOMS.filter((r) => r.type === 'LAB').length, // 3
   timeSlots: TIME_SLOTS.length, // 7 — 6 teaching periods + 1 break
-  settings: SETTINGS.length, // 9
+  settings: SETTINGS.length,
   requirements: PLAN_COUNTS.requirements, // 54 — (8+9+10 subjects) × 2 sections
   allocations: PLAN_COUNTS.allocations, // 66
-  qualifications: QUALIFICATIONS.length, // 51
-  sectionAssignments: 52, // distinct (faculty, section) pairs implied by the allocations
+  qualifications: QUALIFICATIONS.length,
+  sectionAssignments: PLAN_COUNTS.sectionAssignments,
 }
 
 /**
@@ -473,7 +543,7 @@ export function buildDemoFixture(db: SqlDatabase, options?: DemoFixtureOptions):
       'INSERT OR IGNORE INTO faculty_sections (faculty_id, section_id) VALUES (?, ?)'
     )
     for (const section of SECTIONS) {
-      for (const spec of SEMESTER_PLAN[section.semester]) {
+      for (const spec of getPlanForSection(section)) {
         const subject = subjectById.get(spec.subjectId)
         if (!subject) throw new Error(`demo fixture: unknown subject ${spec.subjectId}`)
         insertRequirement.run(

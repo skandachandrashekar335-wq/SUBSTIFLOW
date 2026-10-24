@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Settings as SettingsIcon, Clock, Calendar, Users, CheckCircle, Save, Plus, Trash2, Edit, Building2, Award, AlertTriangle, ArrowUp, ArrowDown } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
+import { Badge } from '@/components/ui/Badge'
 import { Card, CardHeader, CardBody } from '@/components/ui/Card'
 import { Input } from '@/components/ui/Input'
 import { Select, SelectOption } from '@/components/ui/Select'
@@ -55,6 +56,8 @@ export function Settings() {
   const [weightDraft, setWeightDraft] = useState<Record<string, string>>({})
   // P5 toggle: may substitutions go to faculty unrelated to the affected class?
   const [allowUnrelatedDraft, setAllowUnrelatedDraft] = useState(true)
+  // Hard constraint: synchronize Indian Language sessions across sections of each semester.
+  const [syncIndianLanguagesDraft, setSyncIndianLanguagesDraft] = useState(true)
   // Multi-faculty absence policy: TEAM_SUFFICIENT (default) or REPLACE_ABSENT.
   const [policyDraft, setPolicyDraft] = useState<MultiFacultyAbsencePolicy>(
     settingsRepository.getMultiFacultyAbsencePolicy()
@@ -94,6 +97,7 @@ export function Settings() {
       Object.fromEntries(Object.entries(savedWeights).map(([key, value]) => [key, String(value)]))
     )
     setAllowUnrelatedDraft(settingsRepository.getAllowUnrelatedSubstitutions())
+    setSyncIndianLanguagesDraft(settingsRepository.getSyncIndianLanguages())
     setAcademicYears(academicYearRepository.findAll())
     setDepartments(departmentRepository.findAll())
   }, [])
@@ -222,6 +226,7 @@ export function Settings() {
         settingsRepository.setSubstitutionWeights(parsed)
         settingsRepository.setAllowUnrelatedSubstitutions(allowUnrelatedDraft)
         settingsRepository.setMultiFacultyAbsencePolicy(policyDraft)
+        settingsRepository.setSyncIndianLanguages(syncIndianLanguagesDraft)
       })
       setRulesError(null)
       showSaved()
@@ -766,7 +771,50 @@ export function Settings() {
         aria-labelledby="settings-tab-rules"
         tabIndex={0}
         hidden={activeTab !== 'rules'}
+        className="space-y-6"
       >
+        <Card>
+          <CardHeader>
+            <h3 className="text-lg font-semibold text-secondary-900">Timetable Scheduling Constraints</h3>
+            <p className="text-sm text-secondary-500">Core hard rules enforced by the generation engine, draft editor, and validator.</p>
+          </CardHeader>
+          <CardBody className="space-y-4">
+            <div className="flex items-start justify-between gap-4 p-3.5 rounded-lg border border-secondary-200 bg-secondary-50/50">
+              <div className="space-y-1">
+                <label htmlFor="sync-lang-toggle" className="text-sm font-medium text-secondary-900 flex items-center gap-2 cursor-pointer">
+                  <span>Semester-Wide Indian Language Synchronization</span>
+                  <Badge variant="neutral" className="text-[10px] font-normal border-primary-300 text-primary-700 bg-primary-50">Core Rule</Badge>
+                </label>
+                <p className="text-xs text-secondary-600 max-w-2xl">
+                  When enabled, all sections belonging to the same semester (e.g. I BCA A and I BCA B) are scheduled
+                  for their common Indian Language sessions in the exact same time slot (day and period), matching college curriculum requirements.
+                  Distinct faculty must be allocated to each section.
+                </p>
+              </div>
+              <input
+                id="sync-lang-toggle"
+                type="checkbox"
+                checked={syncIndianLanguagesDraft}
+                onChange={(e) => setSyncIndianLanguagesDraft(e.target.checked)}
+                className="h-5 w-5 rounded border-secondary-300 text-primary-600 focus:ring-primary-500 mt-1 cursor-pointer"
+              />
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={() => {
+                try {
+                  settingsRepository.setSyncIndianLanguages(syncIndianLanguagesDraft)
+                  showSaved()
+                } catch (error) {
+                  alert(friendlyMessage(error, 'Could not save timetable rules. Please try again.'))
+                }
+              }}>
+                <Save className="h-4 w-4" />
+                Save Timetable Constraints
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+
         <Card>
           <CardHeader>
             <h3 className="text-lg font-semibold text-secondary-900">Substitution Priority Weights</h3>

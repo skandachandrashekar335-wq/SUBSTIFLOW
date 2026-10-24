@@ -402,7 +402,7 @@ describe('weekly timetable generation from the demo fixture', () => {
     for (const r of rows) {
       const team = r.fac.split(',').sort()
       if (r.code === '24BCA51' || r.code === '24BCAL51') expect(team).toEqual(['demo-fac-01', 'demo-fac-02'])
-      else expect(team).toEqual(['demo-fac-09', 'demo-fac-10'])
+      else expect([['demo-fac-09', 'demo-fac-11'], ['demo-fac-10', 'demo-fac-12']]).toContainEqual(team)
     }
   })
 
@@ -437,6 +437,44 @@ describe('weekly timetable generation from the demo fixture', () => {
       .all(generationId) as Array<{ span: number }>
     expect(rows.length).toBe(16)
     for (const r of rows) expect(r.span).toBe(2)
+  })
+
+  it('synchronizes Indian Language sessions across sections of the same semester', () => {
+    const rows = testDb!
+      .prepare(
+        `SELECT sec.semester, sec.name AS section_name, s.code, d.day_of_week, d.time_slot_id
+           FROM draft_timetable_entries d
+           JOIN sections sec ON sec.id = d.section_id
+           JOIN subjects s ON s.id = d.subject_id
+          WHERE d.generation_id = ? AND s.code IN ('24BCAL12', '24BCAL32')
+          ORDER BY sec.semester, sec.name`
+      )
+      .all(generationId) as Array<{
+        semester: number
+        section_name: string
+        code: string
+        day_of_week: string
+        time_slot_id: string
+      }>
+
+    const bySem = new Map<number, typeof rows>()
+    for (const r of rows) {
+      const list = bySem.get(r.semester) ?? []
+      list.push(r)
+      bySem.set(r.semester, list)
+    }
+
+    // Semester 1 (I BCA A and I BCA B) must share the exact same slot
+    const sem1 = bySem.get(1)!
+    expect(sem1).toHaveLength(2)
+    expect(sem1[0].day_of_week).toBe(sem1[1].day_of_week)
+    expect(sem1[0].time_slot_id).toBe(sem1[1].time_slot_id)
+
+    // Semester 3 (III BCA A and III BCA B) must share the exact same slot
+    const sem3 = bySem.get(3)!
+    expect(sem3).toHaveLength(2)
+    expect(sem3[0].day_of_week).toBe(sem3[1].day_of_week)
+    expect(sem3[0].time_slot_id).toBe(sem3[1].time_slot_id)
   })
 
   it('never schedules the non-teaching staff', () => {

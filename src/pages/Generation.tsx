@@ -41,6 +41,7 @@ import {
   recoverStaleGenerations,
   moveDraftEntry,
   swapDraftEntries,
+  isLanguageSubject,
 } from '@/services/timetableGenerator'
 import { resolveCoveredSlots } from '@/services/timetable'
 import {
@@ -425,6 +426,88 @@ export function Generation() {
       .reduce((sum, r) => sum + r.requiredSessionsPerWeek, 0)
   }, [currentAcademicYear, draftEntries])
 
+  const languageSyncSummary = useMemo(() => {
+    const isSyncActive = settingsRepository.getSyncIndianLanguages()
+    const langEntries = draftEntries.filter((e) => isLanguageSubject(e.subject))
+    const semMap = new Map<number, typeof langEntries>()
+    for (const e of langEntries) {
+      const sem = e.section?.semester ?? 1
+      const list = semMap.get(sem) ?? []
+      list.push(e)
+      semMap.set(sem, list)
+    }
+
+    const summaries: Array<{
+      semester: number
+      sections: string[]
+      sessionCount: number
+      slotsText: string
+      synchronized: boolean
+      subjectName: string
+    }> = []
+
+    for (const [semester, list] of semMap.entries()) {
+      const secEntries = new Map<string, typeof list>()
+      for (const e of list) {
+        const secList = secEntries.get(e.sectionId) ?? []
+        secList.push(e)
+        secEntries.set(e.sectionId, secList)
+      }
+      const sectionNames = Array.from(secEntries.values()).map((items) => items[0].section?.name ?? 'Section')
+      const firstEntry = list[0]
+
+      // Collect unique slots in this semester
+      const slotMap = new Map<string, { dayOfWeek: string; timeSlotId: string }>()
+      for (const e of list) {
+        const k = `${e.dayOfWeek}|${e.timeSlotId}`
+        if (!slotMap.has(k)) slotMap.set(k, { dayOfWeek: e.dayOfWeek, timeSlotId: e.timeSlotId })
+      }
+
+      const sectionEntriesList = Array.from(secEntries.values())
+      const expectedCount = sectionEntriesList[0]?.length ?? 0
+      let isAllSync = sectionEntriesList.length > 1
+
+      for (const sList of sectionEntriesList) {
+        if (sList.length !== expectedCount) {
+          isAllSync = false
+          break
+        }
+      }
+
+      if (isAllSync) {
+        for (const slotInfo of slotMap.values()) {
+          const matching = sectionEntriesList.every((sList) =>
+            sList.some((e) => e.dayOfWeek === slotInfo.dayOfWeek && e.timeSlotId === slotInfo.timeSlotId)
+          )
+          if (!matching) {
+            isAllSync = false
+            break
+          }
+        }
+      }
+
+      const slotLabels = Array.from(slotMap.values()).map((s) => {
+        const slotName = orderedSlots.find((os) => os.id === s.timeSlotId)?.name ?? s.timeSlotId
+        const dayShort = s.dayOfWeek.slice(0, 3)
+        return `${dayShort} ${slotName}`
+      })
+
+      summaries.push({
+        semester,
+        sections: sectionNames,
+        sessionCount: expectedCount,
+        slotsText: slotLabels.join(', '),
+        synchronized: isAllSync,
+        subjectName: firstEntry.subject?.name ?? 'Indian Language',
+      })
+    }
+
+    return {
+      active: isSyncActive,
+      summaries: summaries.sort((a, b) => a.semester - b.semester),
+    }
+  }, [draftEntries, orderedSlots])
+
   if (!currentAcademicYear) {
     return (
       <Card className="max-w-2xl mx-auto mt-8">
@@ -774,6 +857,48 @@ export function Generation() {
                       }
                     />
                   </div>
+                  {languageSyncSummary.summaries.length > 0 && (
+                    <Card className="border-indigo-100 bg-indigo-50/30">
+                      <CardBody className="p-4 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-sm font-semibold text-secondary-900 flex items-center gap-2">
+                            <span>Semester-Wide Language Synchronization</span>
+                            <Badge variant={languageSyncSummary.active ? 'info' : 'neutral'} className="text-[10px]">
+                              {languageSyncSummary.active ? 'Enforced' : 'Disabled'}
+                            </Badge>
+                          </h4>
+                          <span className="text-xs text-secondary-500">
+                            {languageSyncSummary.summaries.every((s) => s.synchronized)
+                              ? 'All semesters synchronized'
+                              : 'Desynchronized sessions detected'}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1">
+                          {languageSyncSummary.summaries.map((item) => (
+                            <div
+                              key={item.semester}
+                              className={cn(
+                                'text-xs p-2.5 rounded border bg-white flex items-center justify-between',
+                                item.synchronized ? 'border-secondary-200' : 'border-red-200 bg-red-50/40'
+                              )}
+                            >
+                              <div>
+                                <span className="font-semibold text-secondary-900">
+                                  Semester {item.semester} ({item.sections.join(', ')})
+                                </span>
+                                <div className="text-secondary-600 mt-0.5">
+                                  {item.subjectName} · {item.slotsText || 'No slots assigned'}
+                                </div>
+                              </div>
+                              <Badge variant={item.synchronized ? 'success' : 'danger'} className="text-[10px]">
+                                {item.synchronized ? `Synchronized (${item.sessionCount}/wk)` : 'Mismatch'}
+                              </Badge>
+                            </div>
+                          ))}
+                        </div>
+                      </CardBody>
+                    </Card>
+                  )}
                   {lastResult && lastResult.generationId === activeGeneration.id && lastResult.search && (
                     <div className="text-xs font-mono text-secondary-500 bg-secondary-50 rounded p-2">
                       Search: {lastResult.search.attempts} attempt(s) in {lastResult.search.elapsedMs} ms
@@ -1288,6 +1413,14 @@ export function renderDraftEntry(
           >
             {classTypeLabel(entry.classType)}
           </span>
+          {isLanguageSubject(entry.subject) && (
+            <span
+              title="Synchronized Indian Language session"
+              className="text-[10px] uppercase tracking-wide px-1 rounded bg-indigo-100 text-indigo-700 font-medium"
+            >
+              Sync IL
+            </span>
+          )}
           {isDraggable && options?.onMoveClick && (
             <button
               type="button"

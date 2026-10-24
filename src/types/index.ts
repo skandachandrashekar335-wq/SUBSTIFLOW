@@ -491,6 +491,7 @@ export interface GenerationConstraintsSnapshot {
   workingHours: WorkingHoursConfig
   multiFacultyAbsencePolicy: MultiFacultyAbsencePolicy
   maxDailySubstitutions: Record<string, number>
+  syncIndianLanguages?: boolean
 }
 
 /** Generation status for UI. */
@@ -514,6 +515,7 @@ export enum GenerationDiagnosticCode {
   FACULTY_OVERLOADED = 'FACULTY_OVERLOADED',
   SECTION_OVERLOADED = 'SECTION_OVERLOADED',
   INSUFFICIENT_QUALIFIED_FACULTY_FOR_LAB = 'INSUFFICIENT_QUALIFIED_FACULTY_FOR_LAB',
+  LANGUAGE_SYNC_CONFLICT = 'LANGUAGE_SYNC_CONFLICT',
   CONSTRAINT_UNSATISFIABLE = 'CONSTRAINT_UNSATISFIABLE',
   /** Configuration problem detected before any search was attempted. */
   INPUT_INVALID = 'INPUT_INVALID',

@@ -249,6 +249,23 @@ export class SettingsRepository extends BaseRepository<ApplicationSettings> {
     )
   }
 
+  /**
+   * Hard constraint: whether common Indian Language sessions must be scheduled
+   * at the exact same time slot across all sections of each semester.
+   * Enabled by default (true).
+   */
+  getSyncIndianLanguages(): boolean {
+    return this.get('sync_indian_languages') !== 'false'
+  }
+
+  setSyncIndianLanguages(value: boolean): void {
+    this.set(
+      'sync_indian_languages',
+      value ? 'true' : 'false',
+      'Synchronize Indian Language sessions across sections of each semester'
+    )
+  }
+
   isSetupComplete(): boolean {
     return this.get('setup_complete') === 'true'
   }
